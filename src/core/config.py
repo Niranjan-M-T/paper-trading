@@ -66,6 +66,12 @@ class Settings:
     # (after market close) is still placed next session. 0 = strict today-only.
     real_trader_intent_max_age_days: int
 
+    # Market-data source for the live poller: 'angel' (default, per-symbol Angel
+    # calls) or 'yfinance' (one batched Yahoo download for the whole universe —
+    # removes the Angel historical-API rate-limit storm). Validated 2026-07-01 to
+    # match Angel bars to a handful of shares. Default 'angel' = unchanged.
+    data_source: str
+
     log_level: str
     log_dir: Path
 
@@ -139,6 +145,7 @@ def load_settings() -> Settings:
         trader_interval_seconds=int(_opt("TRADER_INTERVAL_SECONDS", "60")),
         trader_offset_seconds=int(_opt("TRADER_OFFSET_SECONDS", "5")),
         real_trader_intent_max_age_days=int(_opt("REAL_TRADER_INTENT_MAX_AGE_DAYS", "1")),
+        data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         log_level=_opt("LOG_LEVEL", "INFO").upper(),
         log_dir=REPO_ROOT / _opt("LOG_DIR", "logs"),
         mcp_token=(os.getenv("MCP_TOKEN") or None),

@@ -321,6 +321,35 @@ async def api_bot_quarantine() -> JSONResponse:
     ])
 
 
+# ---------- data-source verification (1-week hybrid audit) ----------
+
+@router.get("/api/bot/verify")
+async def api_bot_verify() -> JSONResponse:
+    """Daily data-source audit rows (written by tools/verify_data_source.py). Shows
+    whether the hybrid yfinance feed is hurting the trader: bar completeness, BUYs
+    skipped by the Angel confirm guard, and rejected orders, per day."""
+    rows = await fetch(
+        "SELECT audit_date, data_source, symbols_checked, symbols_with_gaps, "
+        "bars_captured_med, bars_expected, entries_placed, entries_unconfirmed, "
+        "orders_rejected, verdict FROM data_source_audit ORDER BY audit_date DESC LIMIT 30"
+    )
+    return JSONResponse([
+        {
+            "date": str(r["audit_date"]),
+            "data_source": r["data_source"],
+            "symbols_checked": r["symbols_checked"],
+            "symbols_with_gaps": r["symbols_with_gaps"],
+            "bars_captured_med": r["bars_captured_med"],
+            "bars_expected": r["bars_expected"],
+            "entries_placed": r["entries_placed"],
+            "entries_unconfirmed": r["entries_unconfirmed"],
+            "orders_rejected": r["orders_rejected"],
+            "verdict": r["verdict"],
+        }
+        for r in rows
+    ])
+
+
 # ---------- logs ----------
 
 @router.get("/api/bot/logs")

@@ -164,6 +164,31 @@
   </div>
 </section>
 
+<!-- Data-source verification (1-week hybrid audit: 2026-07-06 → 07-11) -->
+<section class="card-2 mb-5 overflow-hidden" id="verify-section" style="display:none;">
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between">
+    <span class="text-sm font-semibold text-default">Data-source verification <span class="text-muted font-normal">(hybrid yfinance impact — one row/day)</span></span>
+    <span id="verify-latest" class="text-xs text-muted"></span>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-default text-xs text-muted">
+          <th class="px-4 py-2 text-left">Date</th>
+          <th class="px-4 py-2 text-left">Source</th>
+          <th class="px-4 py-2 text-right">Sym gaps</th>
+          <th class="px-4 py-2 text-right">Bars/sym</th>
+          <th class="px-4 py-2 text-right">BUYs</th>
+          <th class="px-4 py-2 text-right">Unconfirmed</th>
+          <th class="px-4 py-2 text-right">Rejects</th>
+          <th class="px-4 py-2 text-left">Verdict</th>
+        </tr>
+      </thead>
+      <tbody id="verify-tbody"></tbody>
+    </table>
+  </div>
+</section>
+
 <!-- SIP Deposits -->
 <section class="card-2 mb-5 overflow-hidden">
   <div class="px-4 py-3 border-b border-default">
@@ -407,6 +432,32 @@
     } catch (_) {}
   }
 
+  async function pollVerify() {
+    try {
+      const r = await fetch("/api/bot/verify");
+      const rows = await r.json();
+      const sec = document.getElementById("verify-section");
+      const tbody = document.getElementById("verify-tbody");
+      const latest = document.getElementById("verify-latest");
+      if (!sec || !tbody) return;
+      if (!rows.length) { sec.style.display = "none"; return; }
+      sec.style.display = "";
+      const pill = v => v === "bad" ? "pill-down" : (v === "warn" ? "pill-muted" : "pill-up");
+      if (latest) latest.textContent = rows.length + " day(s) audited";
+      tbody.innerHTML = rows.map(d => `
+        <tr class="border-b border-default hover:bg-surface2 transition-colors text-xs">
+          <td class="px-4 py-2 font-mono text-default">${esc(d.date)}</td>
+          <td class="px-4 py-2 text-muted">${esc(d.data_source)}</td>
+          <td class="px-4 py-2 text-right ${d.symbols_with_gaps > 0 ? 'text-down' : ''}">${d.symbols_with_gaps}/${d.symbols_checked}</td>
+          <td class="px-4 py-2 text-right">${d.bars_captured_med}/${d.bars_expected}</td>
+          <td class="px-4 py-2 text-right">${d.entries_placed}</td>
+          <td class="px-4 py-2 text-right ${d.entries_unconfirmed > 0 ? 'text-down' : ''}">${d.entries_unconfirmed}</td>
+          <td class="px-4 py-2 text-right ${d.orders_rejected > 0 ? 'text-down' : ''}">${d.orders_rejected}</td>
+          <td class="px-4 py-2"><span class="pill text-[10px] ${pill(d.verdict)}">${esc((d.verdict||"").toUpperCase())}</span></td>
+        </tr>`).join("");
+    } catch (_) {}
+  }
+
   // ---- toggle ----
   window.toggleBot = async function () {
     const btn = document.getElementById("toggle-btn");
@@ -489,6 +540,7 @@
   pollHoldings();
   pollOrders();
   pollQuarantine();
+  pollVerify();
   pollLogs();
 
   setInterval(pollStatus, 15_000);    // status every 15s
@@ -496,6 +548,7 @@
   setInterval(pollHoldings, 30_000);  // holdings every 30s
   setInterval(pollOrders, 20_000);    // orders every 20s
   setInterval(pollQuarantine, 60_000); // quarantine every 60s
+  setInterval(pollVerify, 300_000);    // data-source audit every 5m
   setInterval(() => {                  // logs every 10s, if auto is checked
     const auto = document.getElementById("log-autorefresh");
     if (auto && auto.checked) pollLogs();

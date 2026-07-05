@@ -33,6 +33,7 @@ from src.core.db import close_pool, conn, get_pool, heartbeat
 from src.core.logging import setup_logging
 from src.core.time import IST, is_market_open, now_ist, seconds_until_market_open
 from src.core.universe import load_universe
+from src.core.yf_provider import fetch_5m
 
 
 log = setup_logging("poller")
@@ -84,6 +85,21 @@ async def upsert_bars(symbol: str, df) -> int:
     return len(rows)
 
 
+async def _poll_once_yf(specs) -> int:
+    """One batched yfinance download for the whole universe, then upsert per symbol.
+    Returns the number of rows upserted. Runs the (blocking) yfinance call in a
+    thread so the event loop isn't stalled."""
+    symbols = [s.symbol for s in specs]
+    long_df = await asyncio.to_thread(fetch_5m, symbols, "1d")
+    if long_df is None or long_df.empty:
+        log.warning("yfinance batch returned no rows", extra={"symbols": len(symbols)})
+        return 0
+    total = 0
+    for sym, group in long_df.groupby("symbol"):
+        total += await upsert_bars(str(sym), group)
+    return total
+
+
 async def poll_once(client: AngelClient) -> None:
     """One pass over the universe — fetch the trailing few 5-min bars and upsert.
 
@@ -98,6 +114,27 @@ async def poll_once(client: AngelClient) -> None:
     # are cheap; over-fetching by a couple of bars is the right trade-off.
     since = (now - timedelta(minutes=15)).replace(second=0, microsecond=0)
     until = now.replace(second=0, microsecond=0)
+
+    # Hybrid data source: one batched yfinance download for the whole universe
+    # instead of 73 sequential Angel calls. This is what removes the Angel
+    # historical-API rate-limit storm. Gated on DATA_SOURCE (default 'angel' =
+    # the unchanged loop below). Angel remains authoritative for entry bars via
+    # the real_trader scan-confirm; yfinance bars are validated to match.
+    if settings.data_source == "yfinance":
+        total = await _poll_once_yf(specs)
+        elapsed = time.monotonic() - t0
+        interval = settings.poller_interval_seconds
+        detail = f"{total} rows · {len(specs)} symbols · {elapsed:.0f}s/cycle · src=yfinance"
+        if elapsed > interval:
+            detail += f" · SLOW (> {interval}s tick)"
+            log.warning("poll cycle slower than tick interval — candles lag real-time",
+                        extra={"elapsed_s": round(elapsed, 1), "interval_s": interval,
+                               "symbols": len(specs), "source": "yfinance"})
+        await heartbeat("poller", "ok", detail=detail)
+        log.info("poll cycle done",
+                 extra={"upserted": total, "symbols": len(specs),
+                        "elapsed_s": round(elapsed, 1), "source": "yfinance"})
+        return
 
     total = 0
     for spec in specs:

@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time as _time
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime, time as _dtime, timedelta as _timedelta
 
 from src.core.angel import AngelClient
 from src.core.config import settings
@@ -36,8 +36,10 @@ from src.core.time import IST, is_market_open, now_ist, seconds_until_market_ope
 from src.core.universe import load_universe
 from src.engine.real_executor import (
     count_stale_intents,
+    entry_bars_agree,
     reconcile_sell_qty,
     scan_time_elapsed,
+    scan_time_of,
     select_new_intents,
     sip_deposit_amount,
     surveillance_reject_code,
@@ -383,6 +385,44 @@ async def existing_intent_keys(portfolio_id: int) -> set[str]:
     return {r["intent_key"] for r in rows}
 
 
+async def _angel_confirms_entry(client: AngelClient, sym: str, meta: dict, trade: dict) -> tuple[bool, str]:
+    """Hybrid money guard: when the bulk data is yfinance, re-fetch the scan bar
+    from Angel (authoritative) and confirm it matches the bar the engine decided on
+    before a real BUY. Only scan entries are gated; pyramid adds/exits are not.
+
+    Fetching Angel for the one candidate symbol is a single call (a handful/day),
+    so it stays far under the rate limit. Fail-safe: a missing/unfetchable Angel bar
+    does NOT confirm (we don't spend real money on an unverifiable entry)."""
+    hhmm = scan_time_of(str(trade.get("reason", "")))
+    if not hhmm:
+        return True, "non-scan entry — nothing to confirm"
+    try:
+        day = _date.fromisoformat(str(trade["date"]))
+    except ValueError:
+        return True, "unparseable intent date — skip confirm"
+    h, m = map(int, hhmm.split(":"))
+    from_dt = _datetime.combine(day, _dtime(h, m))
+    to_dt = from_dt + _timedelta(minutes=5)
+    try:
+        df = await asyncio.to_thread(
+            client.get_candle, symbol=sym, token=meta["token"],
+            exchange=meta["exchange"], interval="5m", from_dt=from_dt, to_dt=to_dt)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Angel confirm fetch failed: {str(exc)[:120]}"
+    angel_close = angel_vol = None
+    if df is not None and not df.empty:
+        row = df.iloc[0]
+        angel_close, angel_vol = float(row["close"]), float(row["volume"])
+    # The (yfinance) bar the engine built the intent from, straight from candles.
+    ts = _datetime.combine(day, _dtime(h, m)).replace(tzinfo=IST)
+    yf = await fetchrow(
+        "SELECT close::float8 AS c, volume AS v FROM candles "
+        "WHERE symbol = $1 AND interval = '5m' AND ts = $2", sym, ts)
+    engine_close = float(yf["c"]) if yf else float(trade["price"])
+    engine_vol = float(yf["v"]) if yf else None
+    return entry_bars_agree(engine_close, engine_vol, angel_close, angel_vol)
+
+
 async def place_new_orders(
     client: AngelClient,
     portfolio: PortfolioRow,
@@ -441,6 +481,16 @@ async def place_new_orders(
                 log.info("skip BUY — insufficient real cash",
                          extra={"symbol": sym, "cost": round(cost, 2), "cash_left": round(cash_left, 2)})
                 continue
+            # Hybrid money guard: when bulk data is yfinance, confirm the entry bar
+            # against Angel (authoritative) before spending real money. No-op when
+            # DATA_SOURCE=angel (the bar already IS Angel's).
+            if settings.data_source == "yfinance":
+                ok, why = await _angel_confirms_entry(client, sym, meta, trade)
+                if not ok:
+                    log.warning("skip BUY — Angel did not confirm entry bar",
+                                extra={"symbol": sym, "reason": trade.get("reason"), "detail": why})
+                    continue
+                log.info("entry bar Angel-confirmed", extra={"symbol": sym, "detail": why})
         else:
             # Broker-bound SELL: never sell more than the account holds; never
             # phantom-sell; sweep orphans on full close. (Pure decision in real_executor.)

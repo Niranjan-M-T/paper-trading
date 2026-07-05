@@ -9,9 +9,11 @@ from __future__ import annotations
 
 from src.engine.real_executor import (
     count_stale_intents,
+    entry_bars_agree,
     intent_key,
     reconcile_sell_qty,
     scan_time_elapsed,
+    scan_time_of,
     select_new_intents,
     sip_deposit_amount,
     surveillance_reject_code,
@@ -257,3 +259,48 @@ def test_no_code_or_empty_is_not_quarantined():
     assert surveillance_reject_code("connection reset by peer") is None
     assert surveillance_reject_code("") is None
     assert surveillance_reject_code(None) is None
+
+
+# ---- scan_time_of / entry_bars_agree: hybrid data-source money guard ----
+
+def test_scan_time_of_extracts_window():
+    assert scan_time_of("entry_scan_11:00_drop_-3%") == "11:00"
+    assert scan_time_of("entry_scan_14:00_drop_-2.5%") == "14:00"
+    assert scan_time_of("pyramid_avg_-10%_lvl1") is None  # non-scan action
+    assert scan_time_of("") is None
+
+
+def test_entry_confirmed_when_close_and_volume_match():
+    # yfinance bar the engine used ~= Angel's authoritative bar → confirm.
+    ok, _ = entry_bars_agree(engine_close=1305.70, engine_volume=54324,
+                             angel_close=1305.70, angel_volume=54328)
+    assert ok is True
+
+
+def test_entry_rejected_on_close_mismatch():
+    # A >0.5% price gap between sources on the entry bar → don't spend real money.
+    ok, why = entry_bars_agree(1000.0, 50000, 1010.0, 50000)  # 1% off
+    assert ok is False
+    assert "close mismatch" in why
+
+
+def test_entry_rejected_on_volume_mismatch():
+    # Price agrees but volume differs >20% → the S404 spike ratio would differ → reject.
+    ok, why = entry_bars_agree(1000.0, 50000, 1000.5, 80000)  # +60% volume
+    assert ok is False
+    assert "volume mismatch" in why
+
+
+def test_entry_not_confirmed_when_angel_bar_missing():
+    # Fail-safe: no Angel bar to confirm against → do NOT place.
+    ok, why = entry_bars_agree(1000.0, 50000, None, None)
+    assert ok is False
+    assert "no Angel bar" in why
+
+
+def test_entry_confirms_on_price_when_volume_unavailable():
+    # If the engine bar volume is unknown, confirm on price alone (can't compare a
+    # spike without both sides).
+    ok, why = entry_bars_agree(1000.0, None, 1001.0, 12345)
+    assert ok is True
+    assert "price only" in why

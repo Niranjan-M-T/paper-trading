@@ -69,6 +69,47 @@ def scan_time_elapsed(reason: str, now_hhmm: str, bar_minutes: int = 5) -> bool:
     return now_hhmm >= ready_at
 
 
+def scan_time_of(reason: str) -> str | None:
+    """Return the scan window 'HH:MM' for a scan entry, else None (non-scan action)."""
+    m = _SCAN_REASON_RE.search(reason or "")
+    return m.group(1) if m else None
+
+
+def entry_bars_agree(
+    engine_close: float,
+    engine_volume: float | None,
+    angel_close: float | None,
+    angel_volume: float | None,
+    tol_close: float = 0.005,
+    tol_vol: float = 0.20,
+) -> tuple[bool, str]:
+    """Money guard for the hybrid data source: before a real BUY, the entry bar the
+    engine decided on (from yfinance) must agree with Angel's authoritative bar.
+
+    Confirms CLOSE within `tol_close` (default 0.5%) and, when both volumes are
+    known, VOLUME within `tol_vol` (default 20%). Volume is the S404 entry gate, so
+    a large volume disagreement means the sources computed a different spike ratio →
+    don't spend real money on it. Returns (agree, human-readable detail).
+
+    Missing Angel bar → do NOT confirm (fail safe). Missing engine volume → confirm
+    on price alone (we can't compare a spike we don't have both sides of).
+    """
+    if angel_close is None or angel_close <= 0 or not engine_close:
+        return False, "no Angel bar to confirm against"
+    close_diff = abs(angel_close - engine_close) / engine_close
+    if close_diff > tol_close:
+        return False, (f"close mismatch {close_diff:.2%} > {tol_close:.2%} "
+                       f"(engine {engine_close:.2f} vs angel {angel_close:.2f})")
+    if engine_volume and angel_volume is not None and engine_volume > 0:
+        vol_diff = abs(angel_volume - engine_volume) / engine_volume
+        if vol_diff > tol_vol:
+            return False, (f"volume mismatch {vol_diff:.0%} > {tol_vol:.0%} "
+                           f"(engine {int(engine_volume)} vs angel {int(angel_volume)})")
+        return True, (f"confirmed: close {close_diff:.2%}, volume {vol_diff:.0%} "
+                      f"(engine {int(engine_volume)} vs angel {int(angel_volume)})")
+    return True, f"confirmed on price only (close {close_diff:.2%}); volume unavailable"
+
+
 def _logical_key_from_trade(trade: dict) -> str:
     """One logical action = date · symbol · side · reason (NO price/qty/time).
 
