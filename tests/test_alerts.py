@@ -17,7 +17,7 @@ os.environ.setdefault("ANGEL_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
 os.environ.setdefault("DASHBOARD_PASSWORD", "test")
 os.environ.setdefault("SESSION_SECRET", "test-secret-do-not-use")
 
-from src.core.alerts import build_debug_bundle, classify  # noqa: E402
+from src.core.alerts import build_debug_bundle, classify, heartbeat_alert_kind  # noqa: E402
 
 
 # ---- classify ----
@@ -77,6 +77,33 @@ def test_rate_limit_signal_in_extra_field_is_counted():
     cat, _ = classify("ERROR", "poll failed",
                       '{"symbol": "MAXHEALTH", "err": "Access denied because of exceeding access rate"}')
     assert cat == "rate_limit"
+
+
+# ---- heartbeat_alert_kind ----
+
+def test_sleeping_runner_is_not_stale_even_when_quiet():
+    """The exact false-positive the live bundle exposed: poller/real_trader/trader
+    report status='sleeping' (market closed) and beat infrequently. A quiet sleeping
+    runner is healthy idle, NOT a stale error."""
+    assert heartbeat_alert_kind("poller", "sleeping", stale=True) is None
+    assert heartbeat_alert_kind("real_trader", "sleeping", stale=True) is None
+
+
+def test_oneshot_cron_is_not_stale_between_runs():
+    assert heartbeat_alert_kind("backfill", "ok", stale=True) is None
+    assert heartbeat_alert_kind("backfill_queue", "ok", stale=True) is None
+
+
+def test_always_on_runner_quiet_during_market_hours_is_stale():
+    # An 'ok' runner that should be beating but went silent IS a real stale alert.
+    assert heartbeat_alert_kind("poller", "ok", stale=True) == "stale"
+    assert heartbeat_alert_kind("poller", "ok", stale=False) is None
+
+
+def test_error_status_always_alerts_even_if_idle_type():
+    # A genuine error is reported regardless of sleeping/cron exemptions.
+    assert heartbeat_alert_kind("poller", "error", stale=False) == "error"
+    assert heartbeat_alert_kind("backfill", "error", stale=False) == "error"
 
 
 # ---- build_debug_bundle ----

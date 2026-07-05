@@ -167,6 +167,20 @@ def collect_log_alerts(hours: int) -> list[dict]:
     return out
 
 
+def heartbeat_alert_kind(app: str, status: str, stale: bool) -> str | None:
+    """Decide whether a heartbeat should raise an alert: 'error' | 'stale' | None.
+
+    Healthy-idle states never raise on staleness — only an actual 'error' status
+    does. Those are: a 'sleeping' always-on runner (parked because the market is
+    closed, so its heartbeat is intentionally infrequent), and a nightly/one-shot
+    cron that's idle between runs."""
+    if status == "error":
+        return "error"
+    if status == "sleeping" or app in _ONESHOT_APPS:
+        return None
+    return "stale" if stale else None
+
+
 async def _collect_heartbeats() -> tuple[list[dict], list[dict]]:
     """Return (full heartbeat list for the bundle, alert rows for errored/stale)."""
     rows = await fetch("SELECT app, last_beat, status, detail FROM runs ORDER BY app")
@@ -183,14 +197,11 @@ async def _collect_heartbeats() -> tuple[list[dict], list[dict]]:
             "last_beat": _ist_iso(last),
             "stale": stale,
         })
-        # Don't flag a nightly/one-shot cron as "stale" — idle is its normal state.
-        if r["app"] in _ONESHOT_APPS and r["status"] != "error":
-            continue
-        if r["status"] == "error" or stale:
-            cat = "stale" if stale else "error"
+        cat = heartbeat_alert_kind(r["app"], r["status"], stale)
+        if cat:
             mins = int((now - last).total_seconds() // 60)
             title = (f"process '{r['app']}' is stale — no heartbeat for {mins} min"
-                     if stale else f"process '{r['app']}' reported an error")
+                     if cat == "stale" else f"process '{r['app']}' reported an error")
             alerts.append({
                 "ts": _ist_iso(last),
                 "ts_utc": last.astimezone(timezone.utc).isoformat(),
