@@ -72,6 +72,16 @@ class Settings:
     # match Angel bars to a handful of shares. Default 'angel' = unchanged.
     data_source: str
 
+    # yfinance resilience knobs (only used when data_source == 'yfinance'):
+    #  - failover: if a batch download covers < this fraction of the universe,
+    #    treat Yahoo as down for that cycle and run the whole poll via Angel.
+    #  - top-up: for symbols yfinance returns ZERO bars for (a fetch/resolve
+    #    failure, not a quiet no-trade window), pull just those from Angel — but
+    #    never more than this many per cycle, so a partial Yahoo outage can't
+    #    re-create the 73-call rate-limit storm.
+    yf_failover_min_coverage: float
+    yf_topup_max_symbols: int
+
     log_level: str
     log_dir: Path
 
@@ -146,6 +156,8 @@ def load_settings() -> Settings:
         trader_offset_seconds=int(_opt("TRADER_OFFSET_SECONDS", "5")),
         real_trader_intent_max_age_days=int(_opt("REAL_TRADER_INTENT_MAX_AGE_DAYS", "1")),
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
+        yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
+        yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),
         log_level=_opt("LOG_LEVEL", "INFO").upper(),
         log_dir=REPO_ROOT / _opt("LOG_DIR", "logs"),
         mcp_token=(os.getenv("MCP_TOKEN") or None),

@@ -85,19 +85,99 @@ async def upsert_bars(symbol: str, df) -> int:
     return len(rows)
 
 
-async def _poll_once_yf(specs) -> int:
-    """One batched yfinance download for the whole universe, then upsert per symbol.
-    Returns the number of rows upserted. Runs the (blocking) yfinance call in a
-    thread so the event loop isn't stalled."""
+# ---- yfinance coverage helpers (pure — unit-tested in tests/test_poller.py) ----
+
+def _covered_symbols(long_df) -> set:
+    """Symbols the yfinance batch actually returned at least one bar for."""
+    if long_df is None or long_df.empty:
+        return set()
+    return {str(s) for s in long_df["symbol"].unique()}
+
+
+def _coverage(symbols: list[str], long_df) -> float:
+    """Fraction of the universe yfinance returned any data for (1.0 if empty universe)."""
+    if not symbols:
+        return 1.0
+    covered = _covered_symbols(long_df)
+    return sum(1 for s in symbols if s in covered) / len(symbols)
+
+
+def _symbols_missing(symbols: list[str], long_df) -> list[str]:
+    """Universe symbols yfinance returned ZERO bars for this cycle (fetch/resolve
+    failures) — NOT partial no-trade gaps, whose symbols still appear in `covered`
+    (Angel can't fill a no-trade window either, so those are deliberately skipped)."""
+    covered = _covered_symbols(long_df)
+    return [s for s in symbols if s not in covered]
+
+
+async def _poll_angel_symbols(client: AngelClient, specs, since, until) -> int:
+    """Fetch each spec's 5m bars over [since, until] from Angel and upsert. Returns
+    rows upserted. AngelSessionError bubbles (token expiry must re-login in main())."""
+    total = 0
+    for spec in specs:
+        try:
+            df = client.get_candle(
+                symbol=spec.symbol, token=spec.token, exchange=spec.exchange,
+                interval=INTERVAL,
+                from_dt=since.replace(tzinfo=None), to_dt=until.replace(tzinfo=None),
+            )
+        except AngelSessionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.error("poll failed", extra={"symbol": spec.symbol, "err": str(exc)})
+            continue
+        total += await upsert_bars(spec.symbol, df)
+        # 1.25s pause between symbols mirrors algo project's rate-limit headroom.
+        await asyncio.sleep(1.25)
+    return total
+
+
+async def _poll_once_yf(client: AngelClient, specs, since, until) -> tuple[int, str]:
+    """Hybrid yfinance poll with Angel fallbacks. Returns (rows_upserted, source_tag).
+
+    1. One batched yfinance download for the whole universe (runs the blocking
+       call in a thread so the event loop isn't stalled).
+    2. Whole-poller FAILOVER: if the batch is empty or covers less than
+       settings.yf_failover_min_coverage of the universe, Yahoo is effectively
+       down this cycle — run the entire poll through Angel instead, so the bot
+       never goes blind.
+    3. Per-symbol TOP-UP: symbols yfinance returned zero bars for (a resolve/fetch
+       failure — distinct from a quiet no-trade window, which Angel can't fill
+       either) are re-pulled from Angel for the full session so far, capped at
+       settings.yf_topup_max_symbols so a partial Yahoo outage can't reintroduce
+       the rate-limit storm."""
     symbols = [s.symbol for s in specs]
     long_df = await asyncio.to_thread(fetch_5m, symbols, "1d")
-    if long_df is None or long_df.empty:
-        log.warning("yfinance batch returned no rows", extra={"symbols": len(symbols)})
-        return 0
+    coverage = _coverage(symbols, long_df)
+
+    if long_df is None or long_df.empty or coverage < settings.yf_failover_min_coverage:
+        log.warning("yfinance coverage low — failing over to Angel this cycle",
+                    extra={"coverage": round(coverage, 3),
+                           "min": settings.yf_failover_min_coverage,
+                           "symbols": len(symbols)})
+        total = await _poll_angel_symbols(client, specs, since, until)
+        return total, f"angel (yfinance failover · cov={coverage:.0%})"
+
     total = 0
     for sym, group in long_df.groupby("symbol"):
         total += await upsert_bars(str(sym), group)
-    return total
+
+    missing = _symbols_missing(symbols, long_df)
+    src = "yfinance"
+    if missing:
+        cap = settings.yf_topup_max_symbols
+        missing_set = set(missing)
+        targets = [s for s in specs if s.symbol in missing_set][:cap]
+        # Heal the whole session for a failed symbol, not just the trailing window
+        # — it may have been missing from Yahoo since the open.
+        session_open = until.replace(hour=9, minute=15, second=0, microsecond=0)
+        topped = await _poll_angel_symbols(client, targets, session_open, until)
+        total += topped
+        src = f"yfinance (+{len(targets)} angel top-up)"
+        log.info("yfinance per-symbol Angel top-up",
+                 extra={"missing": len(missing), "attempted": len(targets),
+                        "capped": len(missing) > cap, "rows": topped})
+    return total, src
 
 
 async def poll_once(client: AngelClient) -> None:
@@ -115,49 +195,16 @@ async def poll_once(client: AngelClient) -> None:
     since = (now - timedelta(minutes=15)).replace(second=0, microsecond=0)
     until = now.replace(second=0, microsecond=0)
 
-    # Hybrid data source: one batched yfinance download for the whole universe
-    # instead of 73 sequential Angel calls. This is what removes the Angel
-    # historical-API rate-limit storm. Gated on DATA_SOURCE (default 'angel' =
-    # the unchanged loop below). Angel remains authoritative for entry bars via
-    # the real_trader scan-confirm; yfinance bars are validated to match.
+    # Hybrid data source (DATA_SOURCE=yfinance): one batched Yahoo download for the
+    # whole universe instead of 73 sequential Angel calls — this removes the Angel
+    # historical-API rate-limit storm — with Angel fallbacks (whole-cycle failover
+    # + per-symbol top-up) inside _poll_once_yf. Angel also stays authoritative for
+    # entry bars via the real_trader scan-confirm. Default 'angel' keeps the
+    # unchanged per-symbol Angel sweep.
     if settings.data_source == "yfinance":
-        total = await _poll_once_yf(specs)
-        elapsed = time.monotonic() - t0
-        interval = settings.poller_interval_seconds
-        detail = f"{total} rows · {len(specs)} symbols · {elapsed:.0f}s/cycle · src=yfinance"
-        if elapsed > interval:
-            detail += f" · SLOW (> {interval}s tick)"
-            log.warning("poll cycle slower than tick interval — candles lag real-time",
-                        extra={"elapsed_s": round(elapsed, 1), "interval_s": interval,
-                               "symbols": len(specs), "source": "yfinance"})
-        await heartbeat("poller", "ok", detail=detail)
-        log.info("poll cycle done",
-                 extra={"upserted": total, "symbols": len(specs),
-                        "elapsed_s": round(elapsed, 1), "source": "yfinance"})
-        return
-
-    total = 0
-    for spec in specs:
-        try:
-            df = client.get_candle(
-                symbol=spec.symbol,
-                token=spec.token,
-                exchange=spec.exchange,
-                interval=INTERVAL,
-                from_dt=since.replace(tzinfo=None),
-                to_dt=until.replace(tzinfo=None),
-            )
-        except AngelSessionError:
-            # The daily token has expired. Don't log it 57 times and keep writing
-            # zero — bubble up so main() re-logs in and retries next cycle.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            log.error("poll failed", extra={"symbol": spec.symbol, "err": str(exc)})
-            continue
-        n = await upsert_bars(spec.symbol, df)
-        total += n
-        # 1.25s pause between symbols mirrors algo project's rate-limit headroom.
-        await asyncio.sleep(1.25)
+        total, src = await _poll_once_yf(client, specs, since, until)
+    else:
+        total, src = await _poll_angel_symbols(client, specs, since, until), "angel"
 
     elapsed = time.monotonic() - t0
     interval = settings.poller_interval_seconds
@@ -165,15 +212,16 @@ async def poll_once(client: AngelClient) -> None:
     # late — the cause of "stale" signals. Surface it loudly so it's visible on
     # /health and in the bot log panel instead of silently lagging.
     slow = elapsed > interval
-    detail = f"{total} rows · {len(specs)} symbols · {elapsed:.0f}s/cycle"
+    detail = f"{total} rows · {len(specs)} symbols · {elapsed:.0f}s/cycle · {src}"
     if slow:
         detail += f" · SLOW (> {interval}s tick — candles lagging real-time)"
         log.warning("poll cycle slower than tick interval — candles lag real-time",
                     extra={"elapsed_s": round(elapsed, 1), "interval_s": interval,
-                           "symbols": len(specs)})
+                           "symbols": len(specs), "source": src})
     await heartbeat("poller", "ok", detail=detail)
     log.info("poll cycle done",
-             extra={"upserted": total, "symbols": len(specs), "elapsed_s": round(elapsed, 1)})
+             extra={"upserted": total, "symbols": len(specs),
+                    "elapsed_s": round(elapsed, 1), "source": src})
 
 
 async def main() -> None:
