@@ -27,12 +27,23 @@ from datetime import date as _date, datetime, time, timedelta, timezone
 from src.core.config import settings
 from src.core.db import close_pool, execute, fetch, fetchrow
 from src.core.logtail import read_log_tail
-from src.core.time import IST, now_ist
+from src.core.time import IST, is_market_open, now_ist
 from src.core.universe import load_universe
 
-EXPECTED_BARS = 75          # NSE 09:15–15:30 at 5m
+FULL_SESSION_BARS = 75      # NSE 09:15–15:30 at 5m, whole day
 GAP_TOLERANCE = 2           # missing more than this many bars = a "gap"
 SAMPLE = ["RELIANCE", "TCS", "INFY", "SBIN", "ICICIBANK"]
+
+
+def _expected_bars(day) -> int:
+    """5m bars that SHOULD exist by now: from 09:15 to min(now, 15:30) IST. A past
+    day → the full 75. Running mid-session expects only the bars formed so far, so
+    an in-progress day isn't falsely flagged as gappy."""
+    now = now_ist()
+    open_dt = datetime.combine(day, time(9, 15), tzinfo=IST)
+    close_dt = datetime.combine(day, time(15, 30), tzinfo=IST)
+    end = close_dt if day < now.date() else min(now, close_dt)
+    return max(0, int((end - open_dt).total_seconds() // 300))
 
 
 async def _bars_per_symbol(symbols: list[str], day) -> dict[str, int]:
@@ -122,11 +133,18 @@ async def run(day) -> dict:
 
     counts = await _bars_per_symbol(symbols, day)
     per_symbol_bars = {s: counts.get(s, 0) for s in symbols}
-    with_gaps = [s for s, n in per_symbol_bars.items() if (EXPECTED_BARS - n) > GAP_TOLERANCE]
+    expected = _expected_bars(day)
+    with_gaps = [s for s, n in per_symbol_bars.items() if (expected - n) > GAP_TOLERANCE]
     captured = sorted(per_symbol_bars.values())
     med_captured = captured[len(captured) // 2] if captured else 0
 
-    close_diff, vol_ratio, sample_detail = _angel_agreement(specs_by_symbol, day)
+    # Only re-pull the Angel agreement sample when the market is CLOSED — during
+    # the session it competes with real_trader for Angel's rate budget (that's the
+    # "backing off" noise). The 16:05 cron run always lands after close.
+    if is_market_open():
+        close_diff, vol_ratio, sample_detail = None, None, {"skipped": "market open"}
+    else:
+        close_diff, vol_ratio, sample_detail = _angel_agreement(specs_by_symbol, day)
     placed, unconfirmed, rejected = await _trader_impact(day)
     verdict = _verdict(len(with_gaps), len(symbols), unconfirmed)
 
@@ -150,15 +168,15 @@ async def run(day) -> dict:
             entries_unconfirmed=EXCLUDED.entries_unconfirmed, orders_rejected=EXCLUDED.orders_rejected,
             verdict=EXCLUDED.verdict, detail=EXCLUDED.detail, created_at=now()
         """,
-        day, settings.data_source, len(symbols), len(with_gaps), EXPECTED_BARS,
+        day, settings.data_source, len(symbols), len(with_gaps), expected,
         med_captured, close_diff, vol_ratio, placed, unconfirmed, rejected, verdict,
         json.dumps(detail),
     )
     return {
         "date": str(day), "data_source": settings.data_source, "symbols": len(symbols),
         "symbols_with_gaps": len(with_gaps), "bars_captured_med": med_captured,
-        "entries_placed": placed, "entries_unconfirmed": unconfirmed,
-        "orders_rejected": rejected, "verdict": verdict,
+        "bars_expected": expected, "entries_placed": placed,
+        "entries_unconfirmed": unconfirmed, "orders_rejected": rejected, "verdict": verdict,
     }
 
 
@@ -173,7 +191,8 @@ async def main(argv: list[str]) -> None:
     print(f"\n=== data-source audit {report['date']} (src={report['data_source']}) ===")
     print(f"  symbols checked      : {report['symbols']}")
     print(f"  symbols with gaps    : {report['symbols_with_gaps']}  (>{GAP_TOLERANCE} bars missing)")
-    print(f"  median bars captured : {report['bars_captured_med']} / {EXPECTED_BARS}")
+    print(f"  median bars captured : {report['bars_captured_med']} / {report['bars_expected']} "
+          f"expected so far{' (mid-session)' if is_market_open() else ''}")
     print(f"  BUYs placed          : {report['entries_placed']}")
     print(f"  BUYs unconfirmed     : {report['entries_unconfirmed']}  (skipped by Angel confirm)")
     print(f"  orders rejected      : {report['orders_rejected']}")
