@@ -97,8 +97,14 @@ async def main(argv: list[str]) -> None:
     print()
 
 
-if __name__ == "__main__":
+async def _amain(argv: list[str]) -> None:
+    # Close the pool on the SAME loop its connections were created on — running
+    # close_pool() in a second asyncio.run() hits "Event loop is closed".
     try:
-        asyncio.run(main(sys.argv))
+        await main(argv)
     finally:
-        asyncio.run(close_pool())
+        await close_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(_amain(sys.argv))
