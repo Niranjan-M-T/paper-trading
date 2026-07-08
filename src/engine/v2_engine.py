@@ -264,6 +264,36 @@ class StrategyV2:
     vix_bear_threshold:   float | None = 20.0   # None → VIX not used
     vix_only_bear:        bool = False          # True → bear only via VIX (no DMA-based bear)
 
+    # ===================================================================================
+    # Round 59 — regime-detection upgrades (ported from the algo project for S505/S525).
+    # ALL default to the exact legacy behaviour (NIFTY_50 close + fixed vix_bear_threshold),
+    # so every existing strategy — including the live S404 — is byte-identical. Only the
+    # levers S505/S525 actually flip are ported; grind/graded/breadth-sizing/RS/liquidity
+    # from the algo's Round 59-60 are deliberately omitted (no vendored strategy uses them).
+    # ===================================================================================
+    # Which series the multi-regime classifier reads for bull/bear/sideways:
+    #   "NIFTY_50" (default/legacy) | "universe" (equal-weight index of the traded universe)
+    #   | "breadth" (% of universe symbols above their own 50-DMA).
+    # "universe"/"breadth" fix the diagnosed large-cap-benchmark-vs-midcap-universe mismatch
+    # (2018/2019/2025 were labelled bull by NIFTY while the universe was in a bear market).
+    # Requires the trader to prime "UNIVERSE" (and "UNIVERSE_BREADTH") into the regime cache.
+    mode_regime_source: str = "NIFTY_50"
+    # Require N consecutive days of a new label before switching (kills 4-day whipsaw). 0 = off.
+    mode_hysteresis_days: int = 0
+    # Fast crash overlay: source close > this fraction below its 60-day high → force bear now
+    # (bypasses the ~20-day DMA lag at crashes). None → disabled.
+    mode_crash_overlay_pct: float | None = None
+    # VIX fear threshold as a rolling-252d percentile instead of the fixed vix_bear_threshold.
+    # e.g. 0.80 → fear when VIX above its trailing 80th percentile. None → use vix_bear_threshold.
+    mode_vix_percentile: float | None = None
+
+    # Drawdown governor (S525): while account equity is more than dd_governor_threshold below
+    # its high-water mark, multiply allocation_pct by dd_governor_scale (de-risk in drawdowns).
+    # e.g. threshold=0.15, scale=0.5 → half-size new entries when >15% below the HWM.
+    # None → disabled (backward-compatible).
+    dd_governor_threshold: float | None = None
+    dd_governor_scale: float = 0.5
+
     # Round 46 — VIX-blended adaptive exits.
     # When enabled, each selected adaptive tier's profit threshold is multiplied by a factor
     # derived from today's India VIX: factor = clamp(1 + (vix - baseline) * slope, lo, hi).
@@ -567,31 +597,44 @@ def regime_series(daily_features_df: pd.DataFrame, source: str | None = None, dm
 def classify_regime_by_date(
     vix_bear_threshold: float | None = 20.0,
     vix_only_bear: bool = False,
+    source: str = "NIFTY_50",
+    hysteresis_days: int = 0,
+    crash_overlay_pct: float | None = None,
+    vix_percentile: float | None = None,
 ) -> pd.Series:
-    """Return a Series (date → 'bull' | 'bear' | 'sideways') using the extended NIFTY CSV.
+    """Return a Series (date → 'bull' | 'bear' | 'sideways') for regime switching.
 
-    When vix_only_bear=False (default):
-      1. If India VIX > vix_bear_threshold AND NIFTY < 50-DMA → 'bear'  (fear + breakdown)
-      2. NIFTY close > 50-DMA AND 20-DMA > 50-DMA → 'bull'  (established uptrend)
-      3. NIFTY close < 50-DMA AND 20-DMA < 50-DMA → 'bear'  (established downtrend)
+    Base rules (source close vs its 20/50-DMA), when vix_only_bear=False (default):
+      1. If India VIX > threshold AND close < 50-DMA → 'bear'  (fear + breakdown)
+      2. close > 50-DMA AND 20-DMA > 50-DMA → 'bull'  (established uptrend)
+      3. close < 50-DMA AND 20-DMA < 50-DMA → 'bear'  (established downtrend)
       4. Everything else → 'sideways'
+    When vix_only_bear=True, bear is triggered ONLY by VIX (no DMA-based bear).
 
-    When vix_only_bear=True:
-      Bear is triggered ONLY by VIX > threshold (no DMA-based bear).
-      This avoids misclassifying sharp-but-brief corrections as 'bear'
-      (e.g., 2024-25: only 19 days with VIX>20 vs 82 with DMA bear).
+    Round-59 levers (all default to the exact legacy NIFTY_50 behaviour):
+      source            : "NIFTY_50" (default) | "universe" | "breadth". universe/breadth
+                          track the traded mid/small-cap universe (fixes the large-cap
+                          benchmark mismatch). Require the trader to have primed "UNIVERSE"
+                          (and "UNIVERSE_BREADTH") into _REGIME_INDEX_CACHE.
+      hysteresis_days   : require N consecutive days of a NEW label before committing it.
+      crash_overlay_pct : source close > this fraction below its 60-day high → force 'bear'.
+      vix_percentile    : VIX fear threshold as a rolling-252d percentile instead of fixed.
 
-    Results are cached by (vix_bear_threshold, vix_only_bear).
+    Cached by the full parameter tuple.
     """
-    cache_key = f"regime_{vix_bear_threshold}_{vix_only_bear}"
+    cache_key = (f"regime_{vix_bear_threshold}_{vix_only_bear}_{source}"
+                 f"_{hysteresis_days}_{crash_overlay_pct}_{vix_percentile}")
     if cache_key in _REGIME_CACHE:
         return _REGIME_CACHE[cache_key]
 
     # === paper-trading patch ============================================
-    # Upstream read NIFTY from NIFTY_50_extended.csv and VIX from
-    # INDIA_VIX_extended.csv. The trader primes both into _REGIME_INDEX_CACHE
-    # from the DB (NIFTY_50 + INDIA_VIX daily 1d closes) before each replay.
-    close = _REGIME_INDEX_CACHE.get("NIFTY_50", pd.Series(dtype=float))
+    # Upstream read the source from a CSV; the trader primes daily 1d closes into
+    # _REGIME_INDEX_CACHE from the DB (NIFTY_50 + INDIA_VIX always; UNIVERSE +
+    # UNIVERSE_BREADTH when a strategy uses mode_regime_source="universe"/"breadth").
+    if source in ("universe", "breadth"):
+        close = _REGIME_INDEX_CACHE.get("UNIVERSE", pd.Series(dtype=float))
+    else:
+        close = _REGIME_INDEX_CACHE.get("NIFTY_50", pd.Series(dtype=float))
     if close.empty:
         return pd.Series(dtype=str)
     close = close.astype(float).sort_index()
@@ -601,26 +644,62 @@ def classify_regime_by_date(
     dma50 = close.rolling(50, min_periods=20).mean()
 
     regime = pd.Series("sideways", index=close.index, dtype=str)
-    bull_mask = (close > dma50) & (dma20 > dma50)
-    regime[bull_mask] = "bull"
+    if source == "breadth":
+        breadth = _REGIME_INDEX_CACHE.get("UNIVERSE_BREADTH", pd.Series(dtype=float))
+        breadth = breadth.astype(float).sort_index().reindex(close.index).ffill()
+        regime[breadth > 0.60] = "bull"
+        if not vix_only_bear:
+            regime[breadth < 0.40] = "bear"
+    else:
+        bull_mask = (close > dma50) & (dma20 > dma50)
+        regime[bull_mask] = "bull"
+        if not vix_only_bear:
+            # DMA-based bear classification
+            bear_mask = (close < dma50) & (dma20 < dma50)
+            regime[bear_mask] = "bear"
 
-    if not vix_only_bear:
-        # DMA-based bear classification
-        bear_mask = (close < dma50) & (dma20 < dma50)
-        regime[bear_mask] = "bear"
+    # Fast crash overlay: deep, quick drawdown from recent high → bear now (skip DMA lag).
+    if crash_overlay_pct is not None:
+        high60 = close.rolling(60, min_periods=20).max()
+        regime[close < high60 * (1.0 - crash_overlay_pct)] = "bear"
 
     # === paper-trading patch ============================================
     # VIX override: high fear → force bear (regardless of DMA). VIX daily
     # closes are primed from the DB under the key "INDIA_VIX".
     _vix = _REGIME_INDEX_CACHE.get("INDIA_VIX", pd.Series(dtype=float))
-    if vix_bear_threshold is not None and not _vix.empty:
+    if (vix_bear_threshold is not None or vix_percentile is not None) and not _vix.empty:
         vix_close = _vix.astype(float).sort_index().reindex(close.index).ffill()
-        if vix_only_bear:
-            vix_bear = vix_close > vix_bear_threshold
+        if vix_percentile is not None:
+            thresh = vix_close.rolling(252, min_periods=60).quantile(vix_percentile)
         else:
-            vix_bear = (vix_close > vix_bear_threshold) & (close < dma50)
+            thresh = pd.Series(vix_bear_threshold, index=vix_close.index)
+        if vix_only_bear:
+            vix_bear = vix_close > thresh
+        else:
+            vix_bear = (vix_close > thresh) & (close < dma50)
         regime[vix_bear.fillna(False)] = "bear"
     # === end patch ======================================================
+
+    # Hysteresis: only commit a label switch after N consecutive days of the new label.
+    if hysteresis_days and hysteresis_days > 1:
+        vals = regime.values.copy()
+        committed = vals[0]
+        pending = committed
+        run = 0
+        for i in range(len(vals)):
+            if vals[i] == committed:
+                pending = committed
+                run = 0
+            elif vals[i] == pending:
+                run += 1
+                if run >= hysteresis_days:
+                    committed = pending
+                    run = 0
+            else:
+                pending = vals[i]
+                run = 1
+            vals[i] = committed
+        regime = pd.Series(vals, index=regime.index, dtype=str)
 
     _REGIME_CACHE[cache_key] = regime
     return regime
@@ -783,6 +862,10 @@ def run_backtest_v2(
         mode_by_date = classify_regime_by_date(
             vix_bear_threshold=strategy.vix_bear_threshold,
             vix_only_bear=strategy.vix_only_bear,
+            source=strategy.mode_regime_source,
+            hysteresis_days=strategy.mode_hysteresis_days,
+            crash_overlay_pct=strategy.mode_crash_overlay_pct,
+            vix_percentile=strategy.mode_vix_percentile,
         )
 
     # Regime series used for conditional MACD and SMA filtering (legacy path).
@@ -844,6 +927,11 @@ def run_backtest_v2(
     sorted_days = sorted(prices["date"].unique())
     for i, d in enumerate(sorted_days):
         trading_day_idx[d] = i
+
+    # Drawdown-governor high-water mark (S525). Updated from each day's closing equity;
+    # while equity is > dd_governor_threshold below it, new-entry size is scaled down.
+    # Unused (never read) when dd_governor_threshold is None → parity preserved.
+    _hwm_equity = float(strategy.starting_cash)
 
     for day, day_prices in prices.groupby("date", sort=True):
         # ---- SIP deposit injection ----
@@ -1417,6 +1505,12 @@ def run_backtest_v2(
                             alloc = max(cash * _eff_alloc, 0.0)
                         else:
                             alloc = strategy.allocation_per_trade
+                        # Drawdown governor (S525): de-risk new entries while the account is
+                        # more than dd_governor_threshold below its high-water mark. None →
+                        # skipped entirely, so every other strategy is byte-identical.
+                        if strategy.dd_governor_threshold is not None and _hwm_equity > 0:
+                            if current_equity < _hwm_equity * (1.0 - strategy.dd_governor_threshold):
+                                alloc *= strategy.dd_governor_scale
                         # Mean-reversion half-life allocation boost.
                         # Faster reverters (shorter halflife) get proportionally more capital.
                         if strategy.mr_halflife_alloc_boost is not None:
@@ -1504,13 +1598,17 @@ def run_backtest_v2(
         # ---- Mark equity ----
         marks = day_prices.sort_values("timestamp").groupby("symbol").tail(1).set_index("symbol")["close"]
         holdings_value = sum(pos["qty"] * marks.get(symbol, pos["avg_price"]) for symbol, pos in holdings.items())
+        _eq_today = float(cash + holdings_value)
         equity_curve.append({
             "date": str(day),
             "cash": round(cash, 2),
             "holdings_value": round(float(holdings_value), 2),
-            "equity": round(float(cash + holdings_value), 2),
+            "equity": round(_eq_today, 2),
             "open_positions": len(holdings),
         })
+        # Drawdown-governor high-water mark (S525): raised by new equity peaks only.
+        if _eq_today > _hwm_equity:
+            _hwm_equity = _eq_today
 
     final_equity = equity_curve[-1]["equity"] if equity_curve else strategy.starting_cash
     total_charges = sum(t["charges"] for t in trades)

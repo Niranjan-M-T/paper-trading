@@ -141,6 +141,23 @@ FIELD_SCHEMA: dict[str, dict[str, Any]] = {
         "kind": "bool", "group": "Regime",
         "doc": "If true, bear regime is triggered ONLY by VIX (no DMA-based bear classification).",
     },
+    "mode_regime_source": {
+        "kind": "str", "options": ["NIFTY_50", "universe", "breadth"], "group": "Regime",
+        "doc": "Series the multi-regime classifier reads: 'NIFTY_50' (large-cap, legacy) or "
+               "'universe'/'breadth' (the traded mid/small-cap universe). Needs UNIVERSE primed.",
+    },
+    "mode_hysteresis_days": {
+        "kind": "int", "group": "Regime",
+        "doc": "Require N consecutive days of a new regime label before switching (0 = off; kills whipsaw).",
+    },
+    "mode_crash_overlay_pct": {
+        "kind": "optional_float", "group": "Regime",
+        "doc": "Fast crash overlay: source close > this fraction below its 60-day high forces bear (e.g. 0.08 = -8%). None = off.",
+    },
+    "mode_vix_percentile": {
+        "kind": "optional_float", "group": "Regime",
+        "doc": "Use VIX's rolling-252d percentile as the fear threshold instead of vix_bear_threshold (e.g. 0.80). None = use the fixed level.",
+    },
 
     # Pyramiding
     "pyramid_levels": {
@@ -240,6 +257,15 @@ FIELD_SCHEMA: dict[str, dict[str, Any]] = {
         "doc": "SIP fee-efficiency gate: skip ALL new entries on days when free cash < this (₹). "
                "Avoids tiny positions where the ₹15.34 DP sell charge is an outsized % of turnover. "
                "Has no effect on pyramid adds or exits. None = disabled.",
+    },
+    "dd_governor_threshold": {
+        "kind": "optional_float", "group": "Sizing",
+        "doc": "Drawdown governor (S525): while equity is more than this fraction below its high-water "
+               "mark, scale new-entry size by dd_governor_scale (e.g. 0.15 = -15%). None = disabled.",
+    },
+    "dd_governor_scale": {
+        "kind": "float", "group": "Sizing",
+        "doc": "Allocation multiplier applied while the drawdown governor is active (e.g. 0.5 = half-size).",
     },
 
     # Adaptive exits / VIX blend
