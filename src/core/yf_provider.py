@@ -15,11 +15,22 @@ The pure normaliser (`normalize_yf_frame`) is unit-tested; the thin live fetch
 
 from __future__ import annotations
 
+import logging
 import re
 
 import pandas as pd
 
 from src.core.time import IST
+
+# yfinance logs EVERY unresolved ticker in a batch at ERROR level ("possibly
+# delisted; no price data found") plus an "N Failed downloads:" summary. At the
+# 09:15 open Yahoo often hasn't published the first 5m bar yet, so a batch
+# legitimately misses a chunk of (even liquid) symbols for a cycle or two before
+# it self-heals — and thin names miss quiet windows all day. The poller's Angel
+# top-up/failover heals the DATA; real coverage problems surface via the poller's
+# own coverage warning + the daily audit. So silence yfinance's redundant
+# per-symbol chatter to keep the debug bundle actionable (was ~98 events/48h).
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 # Strip NSE series suffixes to get the Yahoo base symbol; ".NS" = Yahoo's NSE suffix.
 _SUFFIX = re.compile(r"-(EQ|BE|BZ|SM|ST)$")
