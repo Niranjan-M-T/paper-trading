@@ -32,6 +32,9 @@ def test_registry_loads_all_strategies():
         "S228_multiregime_bear_pyr_small",
         "S283_mm_dma_classic",
         "S404_s392_side_only",
+        "S455_s447_pat250_12",
+        "S505_pat_uni_vixpct_crash",
+        "S525_s505_ddgov",
     }
 
 
