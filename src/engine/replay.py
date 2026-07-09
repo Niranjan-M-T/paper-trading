@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.core.db import conn, fetchrow
 from src.core.time import IST, now_ist
+from src.engine.universe_index import build_from_candles
 from src.engine.v2_engine import (
     ChargeConfigV2,
     StrategyV2,
@@ -126,6 +127,21 @@ async def load_index_close(symbol: str, interval: str = "1d") -> pd.Series:
     df["ts"] = pd.to_datetime(df["ts"]).dt.tz_convert(IST)
     df["date"] = df["ts"].dt.date
     return df.groupby("date")["close"].last()
+
+
+async def load_universe_index(
+    symbols: list[str], since: datetime, until: datetime,
+) -> tuple[pd.Series, pd.Series]:
+    """Build the equal-weight universe index + breadth from the DB's 5m equity candles
+    over [since, until] (src/engine/universe_index). Feeds classify_regime_by_date(
+    source="universe"/"breadth") for S505/S525. Empty series when there are no candles.
+
+    Pass a `since` well before the earliest replay day (>= ~1 trading year) so the index's
+    50-DMA / 60-day-high / 252-day-VIX-percentile windows are warmed up on the days the
+    engine actually classifies.
+    """
+    candles = await load_candles_window(symbols, "5m", since, until)
+    return build_from_candles(candles)
 
 
 # ---------- Persisting engine output ----------
@@ -366,12 +382,19 @@ async def replay_one_portfolio(
     deposits: dict[str, float] | None = None,
     external_positions: dict[str, dict] | None = None,
     cash_override: dict[str, float] | None = None,
+    universe_close: pd.Series | None = None,
+    universe_breadth: pd.Series | None = None,
 ) -> dict:
     """Run the engine for this portfolio against the given candles window.
     Returns the engine's full result dict and persists trades / positions / equity.
 
     `vix_close` is the INDIA_VIX daily-close series — required by multi-regime
     strategies (S228/S283) for the VIX-fear regime override; harmless if absent.
+
+    `universe_close` / `universe_breadth` are the equal-weight universe index and
+    breadth (src/engine/universe_index) — required only by strategies whose
+    mode_regime_source is "universe"/"breadth" (S505/S525). None (default) → the
+    classifier falls back to NIFTY_50, so every NIFTY-source strategy is unaffected.
 
     `deposits` is the SIP variable-deposit map ({"YYYY-MM-DD": amount}) for the
     live real-money portfolio; the first deposit is `starting_cash`, later ones
@@ -393,6 +416,10 @@ async def replay_one_portfolio(
         prime_regime_index("SENSEX", sensex_close)
     if vix_close is not None and not vix_close.empty:
         prime_regime_index("INDIA_VIX", vix_close)
+    if universe_close is not None and not universe_close.empty:
+        prime_regime_index("UNIVERSE", universe_close)
+    if universe_breadth is not None and not universe_breadth.empty:
+        prime_regime_index("UNIVERSE_BREADTH", universe_breadth)
 
     # Apply per-portfolio strategy overrides (set by the user from the dashboard).
     # If validation fails, skip this portfolio's tick — never silently corrupt state.

@@ -49,6 +49,7 @@ from src.engine.replay import (
     load_candles_window,
     load_index_close,
     load_portfolios,
+    load_universe_index,
     replay_one_portfolio,
 )
 from src.engine.v2_engine import ChargeConfigV2
@@ -58,6 +59,43 @@ from src.strategies.registry import get as get_strategy
 log = setup_logging("real_trader")
 CHARGES = ChargeConfigV2()
 CANDLE_INTERVAL = "5m"
+
+# Universe regime feed (S505/S525 mode_regime_source="universe"/"breadth"). The
+# equal-weight index is DAILY, so it's built once per trading day and reused across
+# every tick — rebuilding a multi-year 5m sweep each 60s tick would be wasteful.
+# ~3 trading years of lookback warms the 50-DMA / 60d-high / 252d-VIX-percentile
+# windows well past the cold-start and covers any live portfolio's replay span.
+_UNIVERSE_LOOKBACK_DAYS = 1100
+_universe_cache: dict = {"date": None, "close": None, "breadth": None}
+
+
+def _any_universe_source(portfolios: list[PortfolioRow]) -> bool:
+    """True if any live portfolio's strategy classifies regime off the universe/breadth."""
+    for p in portfolios:
+        try:
+            strat = get_strategy(p.strategy_id)
+        except Exception:  # noqa: BLE001 — unknown strategy id; skip (handled in the main loop)
+            continue
+        if getattr(strat, "mode_regime_source", "NIFTY_50") in ("universe", "breadth"):
+            return True
+    return False
+
+
+async def _universe_index_if_needed(portfolios, symbols, until):
+    """Build (day-cached) the universe index + breadth, but ONLY when a live strategy
+    needs it. Returns (None, None) for the NIFTY-source-only setup — zero cost — so the
+    current S404-only bot is unaffected until S505/S525 goes live."""
+    if not _any_universe_source(portfolios):
+        return None, None
+    today = until.date()
+    if _universe_cache["date"] == today and _universe_cache["close"] is not None:
+        return _universe_cache["close"], _universe_cache["breadth"]
+    since = until - _timedelta(days=_UNIVERSE_LOOKBACK_DAYS)
+    close, breadth = await load_universe_index(symbols, since, until)
+    _universe_cache.update(date=today, close=close, breadth=breadth)
+    log.info("universe regime index built",
+             extra={"days": int(len(close)), "lookback_days": _UNIVERSE_LOOKBACK_DAYS})
+    return close, breadth
 
 # A rise in Angel's available cash of at least this much, not explained by a
 # completed SELL since the last snapshot, is recorded as a SIP deposit.
@@ -670,6 +708,7 @@ async def tick() -> None:
     nifty = await load_index_close("NIFTY_50", interval="1d")
     sensex = await load_index_close("SENSEX", interval="1d")
     vix = await load_index_close("INDIA_VIX", interval="1d")
+    uni_close, uni_breadth = await _universe_index_if_needed(portfolios, equity_symbols, until)
 
     total_placed = 0
     total_stale = 0
@@ -684,6 +723,7 @@ async def tick() -> None:
                 record_intraday=True, deposits=deposits or None,
                 external_positions=external_map or None,
                 cash_override=cash_override,
+                universe_close=uni_close, universe_breadth=uni_breadth,
             )
             if result.get("validation_errors"):
                 continue
