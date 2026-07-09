@@ -144,6 +144,43 @@ async def load_universe_index(
     return build_from_candles(candles)
 
 
+# ---- Universe regime priming (shared by the live + paper traders) ----
+# The equal-weight universe index is a DAILY series, so build it once per trading day and
+# reuse across ticks. Only built when a portfolio's strategy classifies regime off the
+# universe/breadth (S505/S525) — zero cost for NIFTY-source strategies (S404 etc.).
+_UNIVERSE_LOOKBACK_DAYS = 1100  # ~3 trading years: warms 50-DMA / 60d-high / 252d-VIX-pct + any replay span
+_universe_cache: dict = {"date": None, "close": None, "breadth": None}
+
+
+def _any_universe_source(portfolios: list[PortfolioRow]) -> bool:
+    from src.strategies.registry import get as get_strategy  # lazy: avoid import cycle
+    for p in portfolios:
+        try:
+            strat = get_strategy(p.strategy_id)
+        except Exception:  # noqa: BLE001 — unknown strategy id; handled in the caller's loop
+            continue
+        if getattr(strat, "mode_regime_source", "NIFTY_50") in ("universe", "breadth"):
+            return True
+    return False
+
+
+async def universe_index_if_needed(portfolios: list[PortfolioRow], symbols: list[str], until: datetime):
+    """Day-cached (universe_close, universe_breadth) for priming — but only when a live/paper
+    portfolio's strategy uses mode_regime_source="universe"/"breadth" (S505/S525). Returns
+    (None, None) otherwise, so NIFTY-source setups (S404) pay nothing and stay byte-identical."""
+    if not _any_universe_source(portfolios):
+        return None, None
+    today = until.date()
+    if _universe_cache["date"] == today and _universe_cache["close"] is not None:
+        return _universe_cache["close"], _universe_cache["breadth"]
+    since = until - timedelta(days=_UNIVERSE_LOOKBACK_DAYS)
+    close, breadth = await load_universe_index(symbols, since, until)
+    _universe_cache.update(date=today, close=close, breadth=breadth)
+    log.info("universe regime index built",
+             extra={"days": int(len(close)), "lookback_days": _UNIVERSE_LOOKBACK_DAYS})
+    return close, breadth
+
+
 # ---------- Persisting engine output ----------
 
 async def upsert_trades(portfolio_id: int, trades: list[dict]) -> int:

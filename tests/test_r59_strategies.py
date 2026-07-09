@@ -77,3 +77,23 @@ def test_s525_adds_dd_governor_on_top_of_s505():
     # … plus the drawdown governor.
     assert s.dd_governor_threshold == 0.15
     assert s.dd_governor_scale == 0.5
+
+
+class _StubPortfolio:
+    def __init__(self, strategy_id: str):
+        self.strategy_id = strategy_id
+
+
+def test_any_universe_source_gates_the_universe_feed():
+    # The trader only builds/primes the universe index when a portfolio uses it — this
+    # is what keeps the S404-only setup zero-cost and byte-identical.
+    from src.engine.replay import _any_universe_source
+    assert _any_universe_source([_StubPortfolio("S404_s392_side_only")]) is False
+    assert _any_universe_source([_StubPortfolio("S455_s447_pat250_12")]) is False  # NIFTY source
+    assert _any_universe_source([_StubPortfolio("S505_pat_uni_vixpct_crash")]) is True
+    assert _any_universe_source([_StubPortfolio("S525_s505_ddgov")]) is True
+    # Mixed: one universe-source portfolio is enough to switch it on.
+    assert _any_universe_source([_StubPortfolio("S404_s392_side_only"),
+                                 _StubPortfolio("S505_pat_uni_vixpct_crash")]) is True
+    # Unknown strategy id → skipped, not raised.
+    assert _any_universe_source([_StubPortfolio("does_not_exist")]) is False

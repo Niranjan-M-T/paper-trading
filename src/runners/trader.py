@@ -31,6 +31,7 @@ from src.engine.replay import (
     load_portfolios,
     prune_intraday_equity,
     replay_one_portfolio,
+    universe_index_if_needed,
 )
 from src.engine.v2_engine import ChargeConfigV2
 from src.strategies.registry import all_strategies, get as get_strategy
@@ -128,6 +129,9 @@ async def tick() -> None:
     nifty   = await load_index_close("NIFTY_50",  interval="1d")
     sensex  = await load_index_close("SENSEX",    interval="1d")
     vix     = await load_index_close("INDIA_VIX", interval="1d")
+    # Universe regime feed for any shadow S505/S525 paper portfolio (day-cached; None
+    # for NIFTY-source portfolios, so existing paper portfolios are unaffected).
+    uni_close, uni_breadth = await universe_index_if_needed(portfolios, equity_symbols, until)
 
     for p in portfolios:
         try:
@@ -141,6 +145,7 @@ async def tick() -> None:
             await replay_one_portfolio(
                 p, strategy, p_candles, CHARGES, nifty, sensex, vix,
                 record_intraday=True,
+                universe_close=uni_close, universe_breadth=uni_breadth,
             )
         except Exception as exc:  # noqa: BLE001
             log.exception("portfolio replay failed",
