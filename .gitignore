@@ -34,6 +34,10 @@ data/*
 # tools/load_regime_history.py, so they must deploy with the repo.
 !data/INDIA_VIX_extended.csv
 !data/NIFTY_50_extended.csv
+# Algo's universe index — reference ONLY (not loaded at runtime; the live universe
+# index is computed from the DB). Used by tools/verify_universe_index.py to validate
+# the DB-built index's regime labels against the algo's (the S505 parity check).
+!data/UNIVERSE_INDEX_extended.csv
 
 # pm2
 .pm2/
