@@ -102,3 +102,42 @@ portfolios:
     strategy: S404_s392_side_only
     capital: 100000
     enabled: true
+
+  # ── Round-59 shadows: S455 / S505 / S525 at the live account's ₹20k, to validate
+  #    S505 (the live-migration target) in paper before flipping real money to it.
+  #    S505/S525 use mode_regime_source="universe" → the trader primes the DB-built
+  #    universe index (universe_index_if_needed; always looks back 1100d, so regime
+  #    warmup is independent of started_at).
+  #    Backdate started_at ~6 months (e.g. 2026-01-01) so the ENGINE'S equity features
+  #    (90d-low needs ~90 trading days) are warm and the shadow replays a real track
+  #    record immediately. Do NOT backdate years: trader.tick loads candles from the
+  #    EARLIEST started_at across all portfolios and re-replays each slice every tick,
+  #    so an over-deep backdate balloons per-tick cost. Pre-INSERT the rows with the
+  #    backdated started_at BEFORE the restart (sync_portfolios_from_yaml preserves
+  #    started_at on conflict); see the deploy runbook in the S505 engine-port notes. ──
+  - name: S455_shadow_20k
+    strategy: S455_s447_pat250_12
+    capital: 20000
+    enabled: true
+  - name: S505_shadow_20k
+    strategy: S505_pat_uni_vixpct_crash
+    capital: 20000
+    enabled: true
+  - name: S525_shadow_20k
+    strategy: S525_s505_ddgov
+    capital: 20000
+    enabled: true
+  # ₹1 lakh siblings — same three strategies at 100k, to see sizing/behaviour at
+  # the larger notional (mirrors the 50k/100k pairing of the other paper portfolios).
+  - name: S455_shadow_100k
+    strategy: S455_s447_pat250_12
+    capital: 100000
+    enabled: true
+  - name: S505_shadow_100k
+    strategy: S505_pat_uni_vixpct_crash
+    capital: 100000
+    enabled: true
+  - name: S525_shadow_100k
+    strategy: S525_s505_ddgov
+    capital: 100000
+    enabled: true
