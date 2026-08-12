@@ -89,6 +89,41 @@
 </p>
 {% endif %}
 
+<!-- Live account performance -->
+<section class="card-2 mb-5 overflow-hidden" id="perf-section">
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between">
+    <span class="text-sm font-semibold text-default">Performance <span class="text-muted font-normal">(live account)</span></span>
+    <span id="perf-updated" class="text-xs text-muted"></span>
+  </div>
+  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 p-4 text-sm">
+    <div>
+      <div class="text-xs text-muted mb-1">Total P&amp;L</div>
+      <div class="font-mono font-semibold" id="perf-total">—</div>
+      <div class="text-xs" id="perf-pct">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-muted mb-1">Realized</div>
+      <div class="font-mono" id="perf-realized">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-muted mb-1">Unrealized</div>
+      <div class="font-mono" id="perf-unrealized">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-muted mb-1">Invested</div>
+      <div class="font-mono text-default" id="perf-invested">—</div>
+    </div>
+    <div title="Compound annual growth rate extrapolated from the return so far.">
+      <div class="text-xs text-muted mb-1">Est. APY</div>
+      <div class="font-mono" id="perf-apy">—</div>
+    </div>
+    <div>
+      <div class="text-xs text-muted mb-1">Days running</div>
+      <div class="font-mono text-default" id="perf-days">—</div>
+    </div>
+  </div>
+</section>
+
 <!-- Holdings -->
 <section class="card-2 mb-5 overflow-hidden">
   <div class="px-4 py-3 border-b border-default flex items-center justify-between">
@@ -188,6 +223,30 @@
     </table>
   </div>
 </section>
+
+{% if not is_viewer %}
+<!-- WhatsApp signal groups (admin) -->
+<section class="card-2 mb-5 overflow-hidden" id="wa-section">
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between">
+    <span class="text-sm font-semibold text-default">WhatsApp signal groups
+      <span class="text-muted font-normal">— live BUY/SELL alerts</span></span>
+    <span id="wa-status" class="text-xs text-muted"></span>
+  </div>
+  <div class="p-4 space-y-3">
+    <div id="wa-targets" class="space-y-2 text-sm"><span class="text-muted">loading…</span></div>
+    <div class="flex flex-wrap items-center gap-2 pt-3 border-t border-default">
+      <select id="wa-group-picker" class="input text-xs py-1 flex-1 min-w-[12rem]">
+        <option value="">— load groups to pick —</option>
+      </select>
+      <input id="wa-jid-input" class="input text-xs py-1" placeholder="or paste JID …@g.us">
+      <button id="wa-add-btn" class="btn-accent text-xs" type="button">Add</button>
+      <button id="wa-load-groups" class="btn-ghost text-xs" type="button">Load groups</button>
+      <button id="wa-test-btn" class="btn-ghost text-xs" type="button">Send test</button>
+    </div>
+    <p class="text-xs text-muted" id="wa-hint"></p>
+  </div>
+</section>
+{% endif %}
 
 <!-- SIP Deposits -->
 <section class="card-2 mb-5 overflow-hidden">
@@ -534,6 +593,103 @@
   const logRefresh = document.getElementById("log-refresh");
   if (logRefresh) logRefresh.addEventListener("click", pollLogs);
 
+  // ---- performance (live account) ----
+  async function pollStats() {
+    try {
+      const r = await fetch("/api/bot/stats");
+      const d = await r.json();
+      if (!d || !d.portfolio) return;
+      const money = v => (v < 0 ? "−₹" : "₹") + Math.abs(v).toLocaleString("en-IN", {maximumFractionDigits: 0});
+      const signMoney = v => v == null ? "—" : (v >= 0 ? "+" : "−") + "₹" + Math.abs(v).toLocaleString("en-IN", {maximumFractionDigits: 0});
+      const pctTxt = v => v == null ? "—" : (v >= 0 ? "+" : "") + v.toFixed(1) + "%";
+      const color = (id, v) => { const el = document.getElementById(id); if (!el || v == null) return; el.classList.toggle("text-up", v > 0); el.classList.toggle("text-down", v < 0); };
+      const T = (id, txt) => { const el = document.getElementById(id); if (el) el.textContent = txt; };
+      T("perf-total", signMoney(d.total_pnl));           color("perf-total", d.total_pnl);
+      T("perf-pct", pctTxt(d.pct));                      color("perf-pct", d.pct);
+      T("perf-realized", signMoney(d.realized_pnl));     color("perf-realized", d.realized_pnl);
+      T("perf-unrealized", signMoney(d.unrealized_pnl)); color("perf-unrealized", d.unrealized_pnl);
+      T("perf-invested", d.invested == null ? "—" : money(d.invested));
+      T("perf-apy", pctTxt(d.est_apy_pct));              color("perf-apy", d.est_apy_pct);
+      T("perf-days", (d.days_running ?? 0) + "d");
+      T("perf-updated", d.portfolio.strategy_id + (d.started_at ? " · since " + d.started_at.slice(0, 10) : ""));
+    } catch (_) {}
+  }
+
+  // ---- WhatsApp signal groups (admin) ----
+  async function pollWaTargets() {
+    const box = document.getElementById("wa-targets");
+    if (!box) return;  // viewer — card not rendered
+    try {
+      const r = await fetch("/api/bot/wa/targets");
+      const d = await r.json();
+      const status = document.getElementById("wa-status");
+      if (status) status.textContent = d.configured ? "gateway on" : "gateway OFF — set WA_* in .env";
+      const targets = d.targets || [];
+      box.innerHTML = targets.length ? targets.map(t => `
+        <div class="flex items-center gap-2">
+          <button type="button" class="pill ${t.enabled ? 'pill-up' : 'pill-muted'}" onclick="waToggle(${t.id})">${t.enabled ? 'on' : 'off'}</button>
+          <span class="text-default">${esc(t.label || '(no name)')}</span>
+          <span class="text-muted text-xs truncate">${esc(t.jid)}</span>
+          <button type="button" class="btn-ghost text-xs ml-auto" onclick="waDelete(${t.id})">Remove</button>
+        </div>`).join("") : '<span class="text-muted">No groups yet — add one below.</span>';
+    } catch (_) {}
+  }
+
+  async function waLoadGroups() {
+    const sel = document.getElementById("wa-group-picker");
+    const hint = document.getElementById("wa-hint");
+    if (!sel) return;
+    if (hint) hint.textContent = "Loading groups from the gateway…";
+    try {
+      const r = await fetch("/api/bot/wa/groups");
+      const d = await r.json();
+      if (!d.configured) { if (hint) hint.textContent = "Gateway not configured — set WA_ENABLED / WA_API_KEY in .env and restart real-trader."; return; }
+      const groups = d.groups || [];
+      sel.innerHTML = '<option value="">— pick a group —</option>' +
+        groups.map(g => `<option value="${esc(g.jid)}" data-label="${esc(g.subject || '')}">${esc(g.subject || g.jid)}</option>`).join("");
+      if (hint) hint.textContent = groups.length + " groups loaded — pick one and Add.";
+    } catch (_) { if (hint) hint.textContent = "Failed to load groups."; }
+  }
+
+  window.waToggle = async function (id) {
+    try { await fetch("/api/bot/wa/targets/toggle", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})}); pollWaTargets(); } catch (_) {}
+  };
+  window.waDelete = async function (id) {
+    if (!confirm("Remove this group from signal alerts?")) return;
+    try { await fetch("/api/bot/wa/targets/delete", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({id})}); pollWaTargets(); } catch (_) {}
+  };
+  async function waAdd() {
+    const sel = document.getElementById("wa-group-picker");
+    const inp = document.getElementById("wa-jid-input");
+    const hint = document.getElementById("wa-hint");
+    const jid = ((inp && inp.value.trim()) || (sel && sel.value) || "").trim();
+    let label = "";
+    if (sel && sel.value && sel.selectedOptions.length) label = sel.selectedOptions[0].getAttribute("data-label") || "";
+    if (!jid) { if (hint) hint.textContent = "Pick a group or paste a JID first."; return; }
+    try {
+      const r = await fetch("/api/bot/wa/targets", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({jid, label})});
+      if (!r.ok) { if (hint) hint.textContent = "Add failed: " + (await r.text()); return; }
+      if (inp) inp.value = "";
+      if (hint) hint.textContent = "Added.";
+      pollWaTargets();
+    } catch (_) { if (hint) hint.textContent = "Add failed."; }
+  }
+  async function waTest() {
+    const hint = document.getElementById("wa-hint");
+    if (hint) hint.textContent = "Sending test…";
+    try {
+      const r = await fetch("/api/bot/wa/test", {method: "POST"});
+      const d = await r.json();
+      if (hint) hint.textContent = d.ok ? ("Test sent to " + d.delivered + " group(s).") : "Test failed — check WA_* config / gateway.";
+    } catch (_) { if (hint) hint.textContent = "Test failed."; }
+  }
+  const waAddBtn = document.getElementById("wa-add-btn");
+  if (waAddBtn) waAddBtn.addEventListener("click", waAdd);
+  const waLoadBtn = document.getElementById("wa-load-groups");
+  if (waLoadBtn) waLoadBtn.addEventListener("click", waLoadGroups);
+  const waTestBtn = document.getElementById("wa-test-btn");
+  if (waTestBtn) waTestBtn.addEventListener("click", waTest);
+
   // ---- initial + interval ----
   pollStatus();
   pollFunds();
@@ -541,6 +697,8 @@
   pollOrders();
   pollQuarantine();
   pollVerify();
+  pollStats();
+  pollWaTargets();
   pollLogs();
 
   setInterval(pollStatus, 15_000);    // status every 15s
@@ -549,6 +707,8 @@
   setInterval(pollOrders, 20_000);    // orders every 20s
   setInterval(pollQuarantine, 60_000); // quarantine every 60s
   setInterval(pollVerify, 300_000);    // data-source audit every 5m
+  setInterval(pollStats, 30_000);      // live-account performance every 30s
+  setInterval(pollWaTargets, 60_000);  // whatsapp targets every 60s
   setInterval(() => {                  // logs every 10s, if auto is checked
     const auto = document.getElementById("log-autorefresh");
     if (auto && auto.checked) pollLogs();

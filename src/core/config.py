@@ -82,6 +82,15 @@ class Settings:
     yf_failover_min_coverage: float
     yf_topup_max_symbols: int
 
+    # WhatsApp signal fan-out (Evolution API gateway). The live bot forwards BUY/SELL
+    # signals to the wa_targets groups so they can be actioned manually (e.g. AB4036
+    # surveillance stocks the bot can't buy itself). Default OFF. The api key controls
+    # the WHOLE gateway, so it lives only in .env — never hard-code it.
+    wa_enabled: bool
+    wa_gateway_url: str
+    wa_api_key: str | None
+    wa_instance: str
+
     log_level: str
     log_dir: Path
 
@@ -158,6 +167,10 @@ def load_settings() -> Settings:
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
         yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),
+        wa_enabled=_opt("WA_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"),
+        wa_gateway_url=_opt("WA_GATEWAY_URL", "https://wa.hosting.studiohappens.tech").rstrip("/"),
+        wa_api_key=(os.getenv("WA_API_KEY") or None),
+        wa_instance=_opt("WA_INSTANCE", "taskflow"),
         log_level=_opt("LOG_LEVEL", "INFO").upper(),
         log_dir=REPO_ROOT / _opt("LOG_DIR", "logs"),
         mcp_token=(os.getenv("MCP_TOKEN") or None),

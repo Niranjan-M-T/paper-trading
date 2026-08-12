@@ -22,8 +22,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from src.core import whatsapp
 from src.core.db import execute, fetch, fetchrow
 from src.core.logtail import read_log_tail
+from src.core.metrics import days_live, estimated_apy, split_pnl
 from src.core.time import IST, is_market_open, now_ist
 from src.web.auth import require_admin
 
@@ -348,6 +350,131 @@ async def api_bot_verify() -> JSONResponse:
         }
         for r in rows
     ])
+
+
+# ---------- live-account performance ----------
+
+@router.get("/api/bot/stats")
+async def api_bot_stats() -> JSONResponse:
+    """Live real-money account performance: total P&L split into realized + unrealized,
+    % return on capital deployed, days running, and an extrapolated APY.
+
+      net_worth   = free cash + market value of holdings
+      invested    = Σ SIP deposits (cost basis actually deployed; falls back to capital)
+      unrealized  = Σ real_holdings.pnl (broker mark-to-market on open positions)
+      realized    = (net_worth − invested) − unrealized
+    """
+    pf = await fetchrow(
+        "SELECT id, name, strategy_id, capital::float8 AS capital, started_at "
+        "FROM portfolios WHERE live = TRUE ORDER BY id LIMIT 1"
+    )
+    if not pf:
+        return JSONResponse({"portfolio": None})
+    funds = await fetchrow(
+        "SELECT available_cash::float8 AS cash FROM real_funds ORDER BY as_of DESC LIMIT 1"
+    )
+    hv = await fetchrow(
+        "SELECT COALESCE(SUM(qty * COALESCE(ltp, avg_price)), 0)::float8 AS v, "
+        "COALESCE(SUM(pnl), 0)::float8 AS pnl FROM real_holdings"
+    )
+    dep = await fetchrow("SELECT COALESCE(SUM(amount), 0)::float8 AS total FROM real_deposits")
+
+    cash = float(funds["cash"]) if funds and funds["cash"] is not None else 0.0
+    holdings_value = float(hv["v"]) if hv else 0.0
+    unrealized = float(hv["pnl"]) if hv else 0.0
+    invested = float(dep["total"]) if dep and dep["total"] else float(pf["capital"])
+    net_worth = cash + holdings_value
+    stats = split_pnl(net_worth, invested, unrealized)
+    return JSONResponse({
+        "portfolio": {"id": pf["id"], "name": pf["name"], "strategy_id": pf["strategy_id"]},
+        "days_running": days_live(pf["started_at"]),
+        "started_at": _iso(pf["started_at"]),
+        "cash": cash,
+        "holdings_value": holdings_value,
+        "invested": stats["invested"],
+        "net_worth": stats["net_worth"],
+        "total_pnl": stats["total_pnl"],
+        "realized_pnl": stats["realized_pnl"],
+        "unrealized_pnl": stats["unrealized_pnl"],
+        "pct": stats["pct"],
+        "est_apy_pct": estimated_apy(net_worth, invested, pf["started_at"]),
+    })
+
+
+# ---------- WhatsApp signal groups (admin) ----------
+
+@router.get("/api/bot/wa/targets")
+async def api_wa_targets() -> JSONResponse:
+    """Destination groups for live BUY/SELL signal alerts (editable below)."""
+    rows = await fetch("SELECT id, jid, label, enabled FROM wa_targets ORDER BY id")
+    return JSONResponse({
+        "configured": whatsapp.configured(),
+        "targets": [
+            {"id": r["id"], "jid": r["jid"], "label": r["label"], "enabled": r["enabled"]}
+            for r in rows
+        ],
+    })
+
+
+@router.post("/api/bot/wa/targets")
+async def api_wa_targets_add(request: Request) -> JSONResponse:
+    require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    jid = str((body or {}).get("jid") or "").strip()
+    label = (str((body or {}).get("label") or "").strip() or None)
+    if not jid or "@" not in jid:
+        raise HTTPException(status_code=400, detail="jid must be a WhatsApp JID like 1203…@g.us")
+    await execute(
+        "INSERT INTO wa_targets (jid, label, enabled) VALUES ($1, $2, TRUE) "
+        "ON CONFLICT (jid) DO UPDATE SET label = COALESCE(EXCLUDED.label, wa_targets.label), "
+        "enabled = TRUE",
+        jid, label,
+    )
+    return JSONResponse({"ok": True})
+
+
+@router.post("/api/bot/wa/targets/toggle")
+async def api_wa_targets_toggle(request: Request) -> JSONResponse:
+    require_admin(request)
+    try:
+        body = await request.json()
+        tid = int((body or {}).get("id"))
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="id (int) required")
+    row = await fetchrow("UPDATE wa_targets SET enabled = NOT enabled WHERE id = $1 RETURNING enabled", tid)
+    return JSONResponse({"ok": row is not None, "enabled": bool(row["enabled"]) if row else None})
+
+
+@router.post("/api/bot/wa/targets/delete")
+async def api_wa_targets_delete(request: Request) -> JSONResponse:
+    require_admin(request)
+    try:
+        body = await request.json()
+        tid = int((body or {}).get("id"))
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="id (int) required")
+    await execute("DELETE FROM wa_targets WHERE id = $1", tid)
+    return JSONResponse({"ok": True})
+
+
+@router.get("/api/bot/wa/groups")
+async def api_wa_groups(request: Request) -> JSONResponse:
+    """List the gateway's WhatsApp groups so the /bot picker can add one by name."""
+    require_admin(request)
+    groups = await whatsapp.fetch_groups()
+    return JSONResponse({"configured": whatsapp.configured(), "groups": groups})
+
+
+@router.post("/api/bot/wa/test")
+async def api_wa_test(request: Request) -> JSONResponse:
+    """Send a test message to every enabled group — confirms the gateway + JIDs work."""
+    require_admin(request)
+    text = f"✅ Test signal from the trading bot · {now_ist().strftime('%Y-%m-%d %H:%M:%S IST')}"
+    delivered = await whatsapp.broadcast(text)
+    return JSONResponse({"ok": delivered > 0, "delivered": delivered})
 
 
 # ---------- logs ----------

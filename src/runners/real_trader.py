@@ -34,8 +34,11 @@ from src.core.db import close_pool, conn, fetch, fetchrow, get_pool, heartbeat
 from src.core.logging import setup_logging
 from src.core.time import IST, is_market_open, now_ist, seconds_until_market_open
 from src.core.universe import load_universe
+from src.core import whatsapp
 from src.engine.real_executor import (
+    _logical_key_from_trade,
     count_stale_intents,
+    engine_symbol_root,
     entry_bars_agree,
     reconcile_sell_qty,
     scan_time_elapsed,
@@ -163,17 +166,26 @@ async def symbol_map() -> dict[str, dict]:
 
 # ---------- Broker ↔ engine reconciliation (single source of truth = the broker) ----------
 
-async def broker_holdings_by_engine(reverse_map: dict[str, str]) -> dict[str, dict]:
+async def broker_holdings_by_engine(
+    reverse_map: dict[str, str], known_engine_syms: set[str] | None = None,
+) -> dict[str, dict]:
     """Current broker holdings keyed by ENGINE symbol (e.g. 'INFY', not 'INFY-EQ').
 
-    `reverse_map` is tradingsymbol → engine symbol (built from symbol_map). Only
-    universe-mapped holdings are returned — the engine can only manage symbols it has
-    candles/features for. Non-universe manual buys are intentionally excluded here (they
-    still show on /bot, just unmanaged)."""
+    `reverse_map` is tradingsymbol → engine symbol (built from symbol_map). We map each
+    holding by exact tradingsymbol first, then fall back to the suffix-stripped root when
+    it's a known engine symbol — so a surveillance-series holding ('XYZ-BE') still
+    reconciles to its engine symbol ('XYZ') and gets adopted/managed. Holdings whose root
+    isn't in the universe are still excluded (the engine has no candles/features for them,
+    so it can't manage them — they show on /bot as unmanaged)."""
+    known = known_engine_syms or set()
     rows = await fetch("SELECT symbol, qty, avg_price::float8 AS avg_price FROM real_holdings")
     out: dict[str, dict] = {}
     for r in rows:
         eng = reverse_map.get(r["symbol"])
+        if not eng:
+            root = engine_symbol_root(r["symbol"])
+            if root in known:
+                eng = root
         if not eng:
             continue
         q = int(r["qty"] or 0)
@@ -576,6 +588,74 @@ async def place_new_orders(
     return placed
 
 
+async def emit_signals(
+    portfolio: PortfolioRow,
+    ready: list[tuple[str, dict]],
+    quarantined: set[str] | None,
+    broker_qty: dict[str, int] | None,
+    available_cash: float | None,
+) -> int:
+    """Forward each ready BUY/SELL signal to the WhatsApp groups (wa_targets), once.
+
+    Deduped on the PRICE-FREE logical key so a still-forming bar or a quarantined-every-
+    tick BUY can't re-notify. Every ready intent is sent (the 'every buy & sell' policy);
+    the ones the bot can't place itself — surveillance quarantine, insufficient cash, or a
+    phantom sell — are flagged 'act manually', which is the whole point of the feed.
+    Best-effort: genuinely-unsent rows are retried next tick; a WhatsApp outage never
+    blocks trading (the caller also wraps this)."""
+    if not whatsapp.configured() or not ready:
+        return 0
+    q = quarantined or set()
+    bq = broker_qty or {}
+    now_str = now_ist().strftime("%H:%M IST")
+    sent = 0
+    blocked = False  # circuit breaker: once a broadcast delivers 0 this tick (gateway
+                     # down / no targets), stop attempting further sends so per-send
+                     # timeouts can't stall the 60s tick — unsent rows retry next tick.
+    for _key, trade in ready:
+        sig_key = _logical_key_from_trade(trade)
+        prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", sig_key)
+        if prev and prev["sent_ok"]:
+            continue  # already delivered — retry only genuinely-unsent rows
+
+        sym = trade["symbol"]
+        side = str(trade["side"]).upper()
+        placeable, note = True, None
+        if side == "BUY":
+            if sym in q:
+                placeable, note = False, "surveillance/cautionary block (e.g. AB4036)"
+            elif (available_cash is not None
+                  and int(trade["qty"]) * float(trade["price"]) * 1.004 > available_cash):
+                placeable, note = False, "insufficient bot cash"
+        else:
+            if int(bq.get(sym, 0)) <= 0:
+                placeable, note = False, "broker holds none of it"
+
+        delivered = 0
+        if not blocked:
+            text = whatsapp.format_signal(
+                trade, portfolio_name=portfolio.name, placeable=placeable, note=note,
+                now_ist_str=now_str)
+            delivered = await whatsapp.broadcast(text)
+            if delivered == 0:
+                blocked = True  # gateway/targets unusable this tick — record & move on
+        await conn_execute(
+            """
+            INSERT INTO real_signals
+                (signal_key, portfolio_id, symbol, side, qty, price, reason, placeable, note, sent_ok, targets)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (signal_key) DO UPDATE
+              SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
+                  targets = GREATEST(real_signals.targets, EXCLUDED.targets)
+            """,
+            sig_key, portfolio.id, sym, side, int(trade["qty"]), float(trade["price"]),
+            trade.get("reason"), placeable, note, delivered > 0, delivered,
+        )
+        if delivered > 0:
+            sent += 1
+    return sent
+
+
 async def reconcile_open_orders(client: AngelClient, portfolio_id: int) -> None:
     """Poll Angel's order book and update any non-terminal real_orders rows."""
     open_rows = await fetch(
@@ -651,7 +731,7 @@ async def tick() -> None:
     # adopted-positions map so the engine manages anything the account holds that it didn't
     # create (manual buys / orphaned fills). Built once per tick from the just-synced state.
     reverse_map = {meta["tradingsymbol"]: eng for eng, meta in sym_map.items()}
-    broker_by_engine = await broker_holdings_by_engine(reverse_map)
+    broker_by_engine = await broker_holdings_by_engine(reverse_map, set(sym_map.keys()))
     broker_qty = {eng: info["qty"] for eng, info in broker_by_engine.items()}
     external_map = await external_positions_map()
 
@@ -722,6 +802,14 @@ async def tick() -> None:
                 client, p, sym_map, ready, available_cash=funds.get("available_cash"),
                 engine_target_qty=engine_target_qty, broker_qty=broker_qty,
                 quarantined=quarantined)
+
+            # Forward every ready signal to the WhatsApp groups (once), flagging the
+            # ones the bot can't place itself so they can be actioned by hand (e.g.
+            # AB4036 surveillance stocks). Never let a WhatsApp issue break the tick.
+            try:
+                await emit_signals(p, ready, quarantined, broker_qty, funds.get("available_cash"))
+            except Exception:  # noqa: BLE001
+                log.exception("whatsapp signal emit failed", extra={"portfolio_id": p.id})
 
             # Surface signals too old to place, so a skipped entry is visible
             # rather than looking like a silent miss.

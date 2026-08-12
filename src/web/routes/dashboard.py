@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from src.core.db import fetch, fetchrow
-from src.core.metrics import estimated_apy
+from src.core.metrics import days_live, estimated_apy
 
 
 router = APIRouter()
@@ -62,6 +62,7 @@ async def _portfolio_cards() -> list[dict]:
             "day_change_pct": day_change_pct,
             "total_pct": total_pct,
             "est_apy_pct": estimated_apy(equity, capital, r["started_at"]),
+            "days_running": days_live(r["started_at"]),
         })
     return cards
 

@@ -29,6 +29,19 @@ _SCAN_REASON_RE = re.compile(r"entry_scan_(\d{2}:\d{2})")
 _SURVEILLANCE_CODES = frozenset({"AB4036"})
 _REJECT_CODE_RE = re.compile(r"\[([A-Za-z0-9]+)\]")
 
+# Angel appends an exchange-series suffix to the tradingsymbol: '-EQ' for the normal
+# rolling segment, and '-BE'/'-BZ'/'-ST'/… for Trade-for-Trade / surveillance scrips.
+# The universe maps the plain engine symbol, so we strip the suffix to reconcile a held
+# '-BE' scrip (typical for an AB4036 stock bought by hand) back to its engine symbol —
+# otherwise it shows up forever as unmanaged. Mirrors the /bot holdings display regex.
+_SERIES_SUFFIX_RE = re.compile(r"-(EQ|BE|BZ|SM|ST|IL|T)$")
+
+
+def engine_symbol_root(broker_symbol: str | None) -> str:
+    """Strip a trailing exchange-series suffix ('RELIANCE-EQ' → 'RELIANCE', 'XYZ-BE' →
+    'XYZ'). Leaves a plain symbol or an unknown suffix untouched."""
+    return _SERIES_SUFFIX_RE.sub("", broker_symbol or "")
+
 
 def surveillance_reject_code(error_text: str | None) -> str | None:
     """Return the broker rejection code IF an order error is a surveillance/cautionary block
