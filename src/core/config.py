@@ -66,6 +66,20 @@ class Settings:
     # (after market close) is still placed next session. 0 = strict today-only.
     real_trader_intent_max_age_days: int
 
+    # The real money actually put INTO the live Angel account (cost basis for the
+    # /bot return %, APY, and P&L split). This is a FIXED figure, not derived from
+    # the broker's mark-to-market net value — because Angel's RMS reports one blended
+    # cash figure with no way to separate an equity top-up from a market rally or a
+    # mutual-fund inflow, which is what fabricated the phantom "deposits". Override
+    # via REAL_OPENING_CAPITAL; genuine later top-ups go in real_deposits by hand.
+    real_opening_capital: float
+
+    # Auto-detect SIP deposits by watching Angel's net account value rise. OFF by
+    # default: it cannot tell a real cash top-up from a holdings rally or an MF
+    # inflow, so every up-move looked like a deposit. Kept as a flag (not deleted)
+    # so it can be re-enabled if Angel ever exposes a segregated equity-cash figure.
+    deposit_autodetect: bool
+
     # Market-data source for the live poller: 'angel' (default, per-symbol Angel
     # calls) or 'yfinance' (one batched Yahoo download for the whole universe —
     # removes the Angel historical-API rate-limit storm). Validated 2026-07-01 to
@@ -164,6 +178,8 @@ def load_settings() -> Settings:
         trader_interval_seconds=int(_opt("TRADER_INTERVAL_SECONDS", "60")),
         trader_offset_seconds=int(_opt("TRADER_OFFSET_SECONDS", "5")),
         real_trader_intent_max_age_days=int(_opt("REAL_TRADER_INTENT_MAX_AGE_DAYS", "1")),
+        real_opening_capital=float(_opt("REAL_OPENING_CAPITAL", "18000")),
+        deposit_autodetect=_opt("DEPOSIT_AUTODETECT", "false").strip().lower() in ("1", "true", "yes", "on"),
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
         yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),

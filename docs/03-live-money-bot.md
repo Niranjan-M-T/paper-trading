@@ -142,12 +142,31 @@ These each cost a real rejection or a silent data gap to learn. Respect them.
 
 ## WhatsApp signal fan-out (Evolution API)
 
-The live bot forwards **every** ready BUY/SELL signal to one or more WhatsApp groups so
-they can be actioned by hand — the point is to catch what the bot can't place itself
-(AB4036 surveillance stocks). `src/core/whatsapp.py` is a defensive Evolution-API client
-(`send_text`/`broadcast`/`fetch_groups`/`format_signal`); a gateway outage logs and
-returns falsy, never breaking the tick. Wired via `real_trader.emit_signals()` after
-`place_new_orders`, so it fires only when the bot is **ON**.
+The live bot WhatsApps its **actual order events** to one or more groups so they can be
+actioned by hand — the point is to catch what the bot itself can't execute (AB4036
+surveillance stocks). The feed is sourced from **`real_orders`** (what the bot really did),
+**not** the strategy replay — so it reflects the live bot, not a paper shadow.
+`src/core/whatsapp.py` is a defensive Evolution-API client (`send_text`/`broadcast`/
+`fetch_groups`/`format_order_event`/`format_quarantine_skip`); a gateway outage logs and
+returns falsy, never breaking the tick. Fires only when the bot is **ON**.
+
+Two emitters, both after `reconcile_open_orders`, both best-effort:
+
+- **`emit_order_signals(pf)`** — walks recent `real_orders` (1-day window):
+  - `status 'open'`   → "🟢 Live bot placed BUY/SELL …" (a heads-up).
+  - `status 'error'/'rejected'` → "⚠️ Live bot … — REJECTED … Buy/sell it manually if you
+    want it." with the broker error (e.g. AB4036). Deduped per **order event**, key
+    `order:<id>:<status>`.
+- **`emit_quarantine_signals(pf, skips)`** — the **Option B** companion: for a BUY the bot
+  *deliberately skipped* because its symbol is benched (no order attempted), sends "🚫 Live
+  bot wants BUY … Skipped — on the surveillance bench (AB4036) … Buy it manually." Deduped
+  per **distinct signal**, key `skip:<intent_key>` (the intent key is `date|symbol|side|
+  reason`), so you get one nudge each time the strategy re-signals a benched name — without
+  the bot firing doomed orders. `place_new_orders` returns these skips alongside its count.
+
+So AB4036 flow: first attempt → REJECTED alert + 3-month bench; each later re-signal →
+a fresh "skipped, buy manually" nudge. Both emitters share a 0-delivery circuit breaker so
+a gateway timeout can't stall the 60s tick.
 
 - **Config** (`.env`, default OFF): `WA_ENABLED`, `WA_GATEWAY_URL`
   (`https://wa.hosting.studiohappens.tech`), `WA_API_KEY` (controls the whole gateway —
@@ -156,15 +175,7 @@ returns falsy, never breaking the tick. Wired via `real_trader.emit_signals()` a
 - **Targets** are the `wa_targets` table (sql/012), editable from /bot (add/remove/toggle,
   a live group picker via `GET /group/fetchAllGroups`, and a send-test). Seeded with
   "Stonks S525 trader signals" = `120363411936940548@g.us`.
-- **Dedup**: `real_signals` (sql/012) keyed on the **price-free** logical key
-  (`date|symbol|side|reason`) so a churning forming bar — or a quarantined-every-tick BUY
-  — can't re-notify; unsent rows retry next tick.
-- **Scope/behavior** (owner's decisions): source = the live real-money portfolio (S404
-  now → S505 after Phase 6; note the group is *named* s525 but receives the live
-  strategy's signals); **every** buy & sell is sent, with the ones the bot can't place
-  (quarantine / no cash / phantom sell) flagged "act manually". The AB4036 **quarantine is
-  unchanged** — it still skips the doomed auto-order (no reject spam); "always signal" is
-  satisfied by the feed.
+- **Dedup ledger**: `real_signals` (sql/012); unsent rows retry next tick.
 
 ## "Unmanaged" manual buys (fixed 2026-07-16)
 
@@ -182,10 +193,17 @@ add it to the universe first.
 
 `/api/bot/stats` + the Performance card show total P&L split into **realized + unrealized**,
 % return on capital deployed, **days running**, and an extrapolated APY. Math in
-`metrics.split_pnl`: `net_worth = cash + Σ(qty·ltp)`, `invested = Σ real_deposits` (SIP cost
-basis; falls back to `capital`), `unrealized = Σ real_holdings.pnl`, `realized = total −
-unrealized`. `metrics.days_live()` also drives a "Nd running" counter on every dashboard
-card.
+`metrics.split_pnl`: `net_worth = cash + Σ(qty·ltp)`, `unrealized = Σ real_holdings.pnl`,
+`realized = total − unrealized`.
+
+**Cost basis (`invested`) is a FIXED figure**, `settings.real_opening_capital` (₹18,000,
+env `REAL_OPENING_CAPITAL`) + any hand-entered `real_deposits` top-ups — **not** the
+broker's mark-to-market net value. Angel's RMS reports one blended cash number, so the old
+net-value SIP detector booked a holdings rally or a mutual-fund inflow as a phantom
+"deposit", which blew up the return % and APY. That detector is now **OFF by default**
+(`DEPOSIT_AUTODETECT=false`; the code path is gated in `sync_funds`, kept behind the flag).
+Genuine later top-ups: insert a `real_deposits` row by hand. `metrics.days_live()` also
+drives a "Nd running" counter on every dashboard card.
 
 ## Testing the live path
 

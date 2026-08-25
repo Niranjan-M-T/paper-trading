@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.core import whatsapp
+from src.core.config import settings
 from src.core.db import execute, fetch, fetchrow
 from src.core.logtail import read_log_tail
 from src.core.metrics import days_live, estimated_apy, split_pnl
@@ -360,12 +361,14 @@ async def api_bot_stats() -> JSONResponse:
     % return on capital deployed, days running, and an extrapolated APY.
 
       net_worth   = free cash + market value of holdings
-      invested    = Σ SIP deposits (cost basis actually deployed; falls back to capital)
+      invested    = fixed real opening capital (settings.real_opening_capital) + any
+                    hand-entered top-ups in real_deposits. NOT the broker's blended net
+                    value, which conflated market moves / MF inflows into phantom deposits.
       unrealized  = Σ real_holdings.pnl (broker mark-to-market on open positions)
       realized    = (net_worth − invested) − unrealized
     """
     pf = await fetchrow(
-        "SELECT id, name, strategy_id, capital::float8 AS capital, started_at "
+        "SELECT id, name, strategy_id, capital::float8 AS capital, started_at, created_at "
         "FROM portfolios WHERE live = TRUE ORDER BY id LIMIT 1"
     )
     if not pf:
@@ -382,12 +385,18 @@ async def api_bot_stats() -> JSONResponse:
     cash = float(funds["cash"]) if funds and funds["cash"] is not None else 0.0
     holdings_value = float(hv["v"]) if hv else 0.0
     unrealized = float(hv["pnl"]) if hv else 0.0
-    invested = float(dep["total"]) if dep and dep["total"] else float(pf["capital"])
+    # Cost basis = the FIXED real opening capital (what actually went into the Angel
+    # account, ~₹18k) plus any genuine hand-entered top-ups. We do NOT use the engine's
+    # seeded `capital` or the broker's mark-to-market net value here: both drift from the
+    # real cash deployed (the latter turned market rallies / MF inflows into phantom
+    # deposits, which is what blew up the return % and APY).
+    deposits_total = float(dep["total"]) if dep and dep["total"] else 0.0
+    invested = settings.real_opening_capital + deposits_total
     net_worth = cash + holdings_value
     stats = split_pnl(net_worth, invested, unrealized)
     return JSONResponse({
         "portfolio": {"id": pf["id"], "name": pf["name"], "strategy_id": pf["strategy_id"]},
-        "days_running": days_live(pf["started_at"]),
+        "days_running": days_live(pf["created_at"]),  # calendar age since created
         "started_at": _iso(pf["started_at"]),
         "cash": cash,
         "holdings_value": holdings_value,
@@ -399,6 +408,37 @@ async def api_bot_stats() -> JSONResponse:
         "pct": stats["pct"],
         "est_apy_pct": estimated_apy(net_worth, invested, pf["started_at"]),
     })
+
+
+# ---------- manual trades (bot-vs-manual split) ----------
+
+@router.get("/api/bot/manual-trades")
+async def api_bot_manual_trades(limit: int = 50) -> JSONResponse:
+    """Executed trades in the account that the BOT did not place — your by-hand app/web
+    trades, tagged from the order book every tick (see real_trader.sync_manual_trades)."""
+    limit = max(1, min(limit, 200))
+    rows = await fetch(
+        "SELECT order_id, symbol, tradingsymbol, side, qty, avg_price::float8 AS avg_price, "
+        "status, exchange, product, order_ts, first_seen FROM manual_trades "
+        "ORDER BY COALESCE(order_ts, first_seen) DESC LIMIT $1",
+        limit,
+    )
+    return JSONResponse([
+        {
+            "order_id": r["order_id"],
+            "symbol": r["symbol"],
+            "tradingsymbol": r["tradingsymbol"],
+            "side": r["side"],
+            "qty": r["qty"],
+            "avg_price": _flt(r["avg_price"]),
+            "status": r["status"],
+            "exchange": r["exchange"],
+            "product": r["product"],
+            "order_ts": _iso(r["order_ts"]),
+            "first_seen": _iso(r["first_seen"]),
+        }
+        for r in rows
+    ])
 
 
 # ---------- WhatsApp signal groups (admin) ----------

@@ -119,6 +119,29 @@ adoption catches them. And added a live-account Performance card (`/api/bot/stat
 realized+unrealized P&L, %, days running, APY) plus a days-running counter on every
 dashboard card. All config-gated (WhatsApp default OFF); real S404 path unchanged.
 
+## 2026-08-25 — Real-orders WhatsApp feed, Option B, fixed cost basis
+
+Follow-ups after the feed went live. **(1) Feed source corrected.** The WhatsApp alerts
+were coming from the strategy *replay* of a paper shadow (`S404_live_sip_20k`), not the
+live bot's real actions. Rewired: `emit_signals` (replay-based) → `emit_order_signals(pf)`
+sourced from `real_orders` — "🟢 placed" on `open`, "⚠️ REJECTED … buy it manually" on
+`error`/`rejected`, deduped `order:<id>:<status>`. **(2) Option B (owner's choice).** Since
+a benched AB4036 symbol produces no more rejections (so the real-orders feed would go silent
+after the first), added `emit_quarantine_signals(pf, skips)`: `place_new_orders` now returns
+the BUYs it skipped as quarantined, and each distinct signal (dedup `skip:<intent_key>`)
+fires a "🚫 skipped — buy it manually" nudge. Net: one REJECTED alert + bench on first hit,
+then an ongoing nudge each time the strategy re-signals it — no doomed-order spam. **(3)
+Cost basis fixed.** Owner couldn't pull an Angel P&L report, so `invested` is now the fixed
+`REAL_OPENING_CAPITAL` (₹18,000) + hand-entered `real_deposits`, replacing the seeded
+`capital` + auto-detected deposits. The net-value SIP detector (which booked holdings
+rallies / MF inflows as phantom deposits) is **OFF by default** (`DEPOSIT_AUTODETECT`),
+gated in `sync_funds`. Engine `capital` is left untouched (changing it would perturb the
+stateless replay's sizing and could fire unexpected orders). **(4)** Also shipped the
+live manual-trade tagger (`manual_trades`, sql/013 — tags account order-book fills the bot
+didn't place) and the `-BE`/`-BZ` adoption fix so INOXGREEN-style surveillance holdings get
+managed. Open item: reconstruct the true opening from `real_orders` (bot-only; blind to
+pre-tagger manual trades and cash moves) as a sanity check on the ₹18k assumption.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

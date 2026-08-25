@@ -109,24 +109,42 @@ async def fetch_groups() -> list[dict]:
         return []
 
 
-def format_signal(trade: dict, *, portfolio_name: str, placeable: bool,
-                  note: str | None, now_ist_str: str) -> str:
-    """Build the WhatsApp message text for one BUY/SELL signal.
+def format_order_event(order: dict, *, now_ist_str: str) -> str:
+    """Build the WhatsApp text for one REAL order event of the live bot.
 
-    Placeable signals read as a plain heads-up; unplaceable ones (quarantine / no
-    cash / phantom sell) carry a clear 'act manually' warning — that's the whole
-    reason the feed exists."""
-    side = str(trade["side"]).upper()
-    emoji = "\U0001F7E2" if side == "BUY" else "\U0001F534"  # 🟢 / 🔴
-    qty = int(trade["qty"])
-    price = float(trade["price"])
-    sym = trade["symbol"]
-    lines = [
-        f"{emoji} {side}  {qty} × {sym}  @ ₹{price:,.2f}",
-        f"≈ ₹{qty * price:,.0f}  ·  {trade.get('reason', '')}",
-        f"{portfolio_name}  ·  {now_ist_str}",
-    ]
-    if not placeable:
-        lines.append(f"⚠️ Bot can't place this — {note or 'manual action needed'}. "
-                     f"Buy/sell manually.")
-    return "\n".join(lines)
+    Sourced from `real_orders` (what the bot actually did), not the strategy replay:
+      * placed (status 'open')       → a plain heads-up that the bot placed it.
+      * rejected (status error/…)    → a clear 'do it manually' warning with the broker
+                                        error (e.g. AB4036), which is the whole point of
+                                        the feed — catching what the bot can't execute."""
+    side = str(order["side"]).upper()
+    sym = order["symbol"]
+    qty = int(order["qty"])
+    price = float(order.get("price") or 0)
+    status = str(order.get("status") or "").lower()
+    if status == "open":
+        emoji = "\U0001F7E2" if side == "BUY" else "\U0001F534"  # 🟢 / 🔴
+        return (f"{emoji} Live bot placed {side}  {qty} × {sym}  @ ₹{price:,.2f}\n"
+                f"{order.get('reason', '') or ''}  ·  {now_ist_str}")
+    err = str(order.get("error") or "").strip() or "rejected by broker"
+    return (f"⚠️ Live bot {side}  {qty} × {sym}  — REJECTED\n"
+            f"{err}\n"
+            f"Buy/sell it manually if you want it.  ·  {now_ist_str}")
+
+
+def format_quarantine_skip(item: dict, *, reason_code: str | None, now_ist_str: str) -> str:
+    """Build the WhatsApp text for a signal the bot DELIBERATELY did not place because the
+    symbol is benched after an earlier surveillance/cautionary block (e.g. AB4036).
+
+    Unlike a rejection, no order was even attempted — the bot knows it would fail — so this
+    is a pure 'the strategy wants this, do it by hand' nudge. It fires once per distinct
+    signal (deduped on the intent key upstream), so you keep getting pinged each time the
+    strategy re-signals a benched name, without the bot spamming doomed orders."""
+    side = str(item["side"]).upper()
+    sym = item["symbol"]
+    qty = int(item["qty"])
+    price = float(item.get("price") or 0)
+    code = f" ({reason_code})" if reason_code else ""
+    return (f"🚫 Live bot wants {side}  {qty} × {sym}  @ ₹{price:,.2f}\n"
+            f"Skipped — on the surveillance bench{code}, the broker blocks it.\n"
+            f"Buy it manually if you want it.  ·  {now_ist_str}")

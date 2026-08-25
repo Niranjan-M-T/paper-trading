@@ -177,6 +177,30 @@
   </div>
 </section>
 
+<!-- Manual trades (not placed by the bot) -->
+<section class="card-2 mb-5 overflow-hidden" id="manual-section" style="display:none;">
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between">
+    <span class="text-sm font-semibold text-default">Manual trades
+      <span class="text-muted font-normal">— placed by you, not the bot</span></span>
+    <span id="manual-count" class="text-xs text-muted"></span>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-default text-xs text-muted">
+          <th class="px-4 py-2 text-left">Time</th>
+          <th class="px-4 py-2 text-left">Symbol</th>
+          <th class="px-4 py-2 text-left">Side</th>
+          <th class="px-4 py-2 text-right">Qty</th>
+          <th class="px-4 py-2 text-right">Avg Price</th>
+          <th class="px-4 py-2 text-left">Status</th>
+        </tr>
+      </thead>
+      <tbody id="manual-tbody"></tbody>
+    </table>
+  </div>
+</section>
+
 <!-- Quarantined (AB4036 auto-skip) -->
 <section class="card-2 mb-5 overflow-hidden" id="quarantine-section" style="display:none;">
   <div class="px-4 py-3 border-b border-default flex items-center justify-between">
@@ -467,6 +491,35 @@
     } catch (_) {}
   }
 
+  // ---- manual trades (bot-vs-manual split) ----
+  async function pollManual() {
+    try {
+      const r = await fetch("/api/bot/manual-trades?limit=50");
+      const rows = await r.json();
+      const sec = document.getElementById("manual-section");
+      const tbody = document.getElementById("manual-tbody");
+      const cnt = document.getElementById("manual-count");
+      if (!tbody || !sec) return;
+      if (!rows.length) { sec.style.display = "none"; return; }
+      sec.style.display = "";
+      if (cnt) cnt.textContent = rows.length + " trade(s)";
+      const fmtP = v => v != null ? "₹" + v.toLocaleString("en-IN", {minimumFractionDigits: 2, maximumFractionDigits: 2}) : "—";
+      const fmtT = s => s ? s.replace("T", " ").slice(0, 16) + " IST" : "—";
+      tbody.innerHTML = rows.map(o => {
+        const sideCls = o.side === "BUY" ? "text-green-600 dark:text-green-400" : "text-red-500";
+        return `
+        <tr class="border-b border-default hover:bg-surface2 transition-colors text-xs">
+          <td class="px-4 py-2 font-mono text-muted whitespace-nowrap">${fmtT(o.order_ts || o.first_seen)}</td>
+          <td class="px-4 py-2 font-mono font-semibold text-default">${esc(o.symbol)}</td>
+          <td class="px-4 py-2 font-semibold ${sideCls}">${esc(o.side)}</td>
+          <td class="px-4 py-2 text-right">${Number(o.qty) || 0}</td>
+          <td class="px-4 py-2 text-right font-mono">${fmtP(o.avg_price)}</td>
+          <td class="px-4 py-2"><span class="pill text-[10px] pill-muted">${esc(o.status || "—")}</span></td>
+        </tr>`;
+      }).join("");
+    } catch (_) {}
+  }
+
   // ---- quarantine polling (AB4036 auto-skip) ----
   async function pollQuarantine() {
     try {
@@ -699,6 +752,7 @@
   pollVerify();
   pollStats();
   pollWaTargets();
+  pollManual();
   pollLogs();
 
   setInterval(pollStatus, 15_000);    // status every 15s
@@ -709,6 +763,7 @@
   setInterval(pollVerify, 300_000);    // data-source audit every 5m
   setInterval(pollStats, 30_000);      // live-account performance every 30s
   setInterval(pollWaTargets, 60_000);  // whatsapp targets every 60s
+  setInterval(pollManual, 30_000);     // manual trades every 30s
   setInterval(() => {                  // logs every 10s, if auto is checked
     const auto = document.getElementById("log-autorefresh");
     if (auto && auto.checked) pollLogs();

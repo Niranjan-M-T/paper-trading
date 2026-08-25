@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-from src.core.db import fetch, fetchrow
+from src.core.db import fetch
 from src.core.metrics import days_live, estimated_apy
 
 
@@ -18,7 +18,7 @@ async def _portfolio_cards() -> list[dict]:
     rows = await fetch(
         """
         SELECT p.id, p.name, p.strategy_id, p.capital::float8 AS capital,
-               p.started_at,
+               p.started_at, p.created_at,
                COALESCE(eq.equity, p.capital)::float8       AS equity,
                COALESCE(eq.cash, p.capital)::float8         AS cash,
                COALESCE(eq.holdings_value, 0)::float8       AS holdings_value,
@@ -61,8 +61,12 @@ async def _portfolio_cards() -> list[dict]:
             "day_change": day_change,
             "day_change_pct": day_change_pct,
             "total_pct": total_pct,
+            # APY annualises over the return-generating span (started_at, which for a
+            # backdated shadow is its replay window). "Days running" is calendar age since
+            # the portfolio was actually created — so a recently-created backdated shadow
+            # reads ~31d, not its 223d replay span.
             "est_apy_pct": estimated_apy(equity, capital, r["started_at"]),
-            "days_running": days_live(r["started_at"]),
+            "days_running": days_live(r["created_at"]),
         })
     return cards
 

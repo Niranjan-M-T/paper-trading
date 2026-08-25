@@ -36,7 +36,6 @@ from src.core.time import IST, is_market_open, now_ist, seconds_until_market_ope
 from src.core.universe import load_universe
 from src.core import whatsapp
 from src.engine.real_executor import (
-    _logical_key_from_trade,
     count_stale_intents,
     engine_symbol_root,
     entry_bars_agree,
@@ -281,38 +280,111 @@ async def sync_funds(client: AngelClient) -> dict:
     net = _num(raw.get("net"), None)
     utilised = _num(raw.get("utiliseddebits"), None)
 
-    # SIP deposit detection is net-value based: a deposit is money that lifts the
-    # account ABOVE its starting capital + deposits already recorded. The initial
-    # funding that *establishes* the capital is not a deposit (counting it on top
-    # of the seeded capital is what fabricated the ~₹19k phantom deposit).
-    hv = await fetchrow(
-        "SELECT COALESCE(SUM(qty * COALESCE(ltp, avg_price)), 0)::float8 AS v FROM real_holdings"
-    )
-    holdings_value = float(hv["v"]) if hv else 0.0
-    account_net = available + holdings_value
-
-    base = await fetchrow(
-        "SELECT (COALESCE((SELECT SUM(capital) FROM portfolios WHERE live AND enabled), 0) "
-        "      + COALESCE((SELECT SUM(amount) FROM real_deposits), 0))::float8 AS b"
-    )
-    expected_baseline = float(base["b"]) if base else 0.0
-
-    dep = sip_deposit_amount(account_net, expected_baseline, MIN_DEPOSIT_DETECT)
-    if dep > 0.0:
-        await conn_execute(
-            "INSERT INTO real_deposits (amount, available_before, available_after, note) "
-            "VALUES ($1, $2, $3, $4)",
-            dep, expected_baseline, account_net,
-            "auto-detected: net value above starting capital + prior deposits",
+    # SIP deposit detection (OFF by default — settings.deposit_autodetect). It watched
+    # Angel's net account value (cash + holdings market value) rise above the seeded
+    # capital + prior deposits and booked the difference as a deposit. But Angel's RMS
+    # gives one blended cash figure, so a holdings rally or a mutual-fund inflow looked
+    # identical to a real equity top-up — that is what fabricated the phantom deposits
+    # and inflated the return. Real top-ups now go in real_deposits by hand; the cost
+    # basis is the fixed settings.real_opening_capital. Left behind the flag so it can be
+    # switched back on if Angel ever exposes a segregated equity-cash balance.
+    if settings.deposit_autodetect:
+        hv = await fetchrow(
+            "SELECT COALESCE(SUM(qty * COALESCE(ltp, avg_price)), 0)::float8 AS v FROM real_holdings"
         )
-        log.info("SIP deposit detected",
-                 extra={"amount": dep, "account_net": account_net, "baseline": expected_baseline})
+        holdings_value = float(hv["v"]) if hv else 0.0
+        account_net = available + holdings_value
+
+        base = await fetchrow(
+            "SELECT (COALESCE((SELECT SUM(capital) FROM portfolios WHERE live AND enabled), 0) "
+            "      + COALESCE((SELECT SUM(amount) FROM real_deposits), 0))::float8 AS b"
+        )
+        expected_baseline = float(base["b"]) if base else 0.0
+
+        dep = sip_deposit_amount(account_net, expected_baseline, MIN_DEPOSIT_DETECT)
+        if dep > 0.0:
+            await conn_execute(
+                "INSERT INTO real_deposits (amount, available_before, available_after, note) "
+                "VALUES ($1, $2, $3, $4)",
+                dep, expected_baseline, account_net,
+                "auto-detected: net value above starting capital + prior deposits",
+            )
+            log.info("SIP deposit detected",
+                     extra={"amount": dep, "account_net": account_net, "baseline": expected_baseline})
 
     await conn_execute(
         "INSERT INTO real_funds (available_cash, net, utilised, raw) VALUES ($1, $2, $3, $4)",
         available, net, utilised, json.dumps(raw),
     )
     return {"available_cash": available, "net": net, "utilised": utilised}
+
+
+def _parse_angel_ts(value) -> "_datetime | None":
+    """Parse an Angel order-book timestamp ('YYYY-MM-DD HH:MM:SS', IST-naive) to an
+    IST-aware datetime. Returns None on anything unparseable."""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M:%S", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return _datetime.strptime(str(value).strip(), fmt).replace(tzinfo=IST)
+        except ValueError:
+            continue
+    return None
+
+
+async def sync_manual_trades(client: AngelClient) -> int:
+    """Tag executed orders the bot did NOT place (your manual app/web trades).
+
+    Angel's order book is account-wide, so it carries manual orders alongside the bot's.
+    Any filled order whose Angel `orderid` isn't in real_orders is a manual trade → record
+    it in `manual_trades` (upsert, so a partial fill firming up just updates the row). This
+    powers the bot-vs-manual split on /bot and the account reconciliation. Best-effort:
+    the order book is current-day, and a fetch failure just logs and skips this tick."""
+    try:
+        book = await asyncio.to_thread(client.get_order_book)
+    except Exception:  # noqa: BLE001
+        log.exception("manual-trade tag: order book fetch failed")
+        return 0
+    if not book:
+        return 0
+    rows = await fetch("SELECT angel_order_id FROM real_orders WHERE angel_order_id IS NOT NULL")
+    bot_ids = {str(r["angel_order_id"]) for r in rows}
+    tagged = 0
+    for o in book:
+        oid = str(o.get("orderid") or "").strip()
+        if not oid or oid in bot_ids:
+            continue  # no id, or it's one of the bot's own orders
+        status = str(o.get("status") or o.get("orderstatus") or "").lower()
+        filled = int(_num(o.get("filledshares"), 0) or 0)
+        # Only record orders that actually traded — a pending/rejected/cancelled manual
+        # order isn't a trade. A fully-executed order reports status 'complete'.
+        if filled <= 0 and status != "complete":
+            continue
+        tsym = str(o.get("tradingsymbol") or "").strip()
+        if not tsym:
+            continue
+        await conn_execute(
+            """
+            INSERT INTO manual_trades
+                (order_id, symbol, tradingsymbol, side, qty, avg_price, status, exchange, product, order_ts, raw)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (order_id) DO UPDATE
+              SET qty = EXCLUDED.qty, avg_price = EXCLUDED.avg_price, status = EXCLUDED.status,
+                  order_ts = COALESCE(EXCLUDED.order_ts, manual_trades.order_ts),
+                  updated_at = now(), raw = EXCLUDED.raw
+            """,
+            oid, engine_symbol_root(tsym), tsym,
+            str(o.get("transactiontype") or "").upper(),
+            filled if filled > 0 else int(_num(o.get("quantity"), 0) or 0),
+            _num(o.get("averageprice"), None),
+            status, o.get("exchange"), o.get("producttype"),
+            _parse_angel_ts(o.get("updatetime") or o.get("exchtime") or o.get("orderdatetime")),
+            json.dumps(o, default=str),
+        )
+        tagged += 1
+    if tagged:
+        log.info("tagged manual trades from order book", extra={"count": tagged})
+    return tagged
 
 
 async def sync_holdings(client: AngelClient) -> int:
@@ -445,7 +517,7 @@ async def place_new_orders(
     engine_target_qty: dict[str, int] | None = None,
     broker_qty: dict[str, int] | None = None,
     quarantined: set[str] | None = None,
-) -> int:
+) -> tuple[int, list[dict]]:
     """Place a CNC LIMIT order at the engine's decided price for each new intent.
     Records intent (status='pending') BEFORE the API call so a crash can't double-place.
 
@@ -463,8 +535,13 @@ async def place_new_orders(
         *entire* broker quantity — clearing duplicate-fill orphans (e.g. broker 6 vs engine
         3). On a partial tier, we sell min(engine qty, broker available) so we never oversell.
       * `sell_reserved` tracks shares already committed THIS tick so multiple tiers for one
-        symbol can't collectively oversell."""
+        symbol can't collectively oversell.
+
+    Returns (placed_count, quarantine_skips): the second element lists BUY intents skipped
+    because their symbol is benched (surveillance/AB4036), so the caller can nudge you to
+    buy them by hand — the whole point being to catch what the bot itself can't execute."""
     placed = 0
+    quarantine_skips: list[dict] = []
     cash_left = available_cash if available_cash is not None else float("inf")
     sell_reserved: dict[str, int] = {}
     for key, trade in new_intents:
@@ -485,6 +562,11 @@ async def place_new_orders(
             if quarantined and sym in quarantined:
                 log.info("skip BUY — symbol quarantined (surveillance/cautionary block)",
                          extra={"symbol": sym, "reason": trade.get("reason")})
+                quarantine_skips.append({
+                    "intent_key": key, "symbol": sym, "side": trade["side"],
+                    "qty": int(trade["qty"]), "price": float(trade["price"]),
+                    "reason": trade.get("reason"),
+                })
                 continue
             # Real-cash guard: skip — don't even claim — an order the account can't
             # afford. ~0.4% buffer for brokerage/STT/stamp/GST.
@@ -585,60 +667,51 @@ async def place_new_orders(
                     await quarantine_symbol(sym, qcode, err, months=3)
                     log.warning("symbol quarantined after surveillance rejection",
                                 extra={"symbol": sym, "code": qcode, "months": 3})
-    return placed
+    return placed, quarantine_skips
 
 
-async def emit_signals(
-    portfolio: PortfolioRow,
-    ready: list[tuple[str, dict]],
-    quarantined: set[str] | None,
-    broker_qty: dict[str, int] | None,
-    available_cash: float | None,
-) -> int:
-    """Forward each ready BUY/SELL signal to the WhatsApp groups (wa_targets), once.
+async def emit_order_signals(portfolio_id: int) -> int:
+    """WhatsApp the live bot's ACTUAL order events — sourced from real_orders, NOT the
+    strategy replay. Notifies once per (order, status):
 
-    Deduped on the PRICE-FREE logical key so a still-forming bar or a quarantined-every-
-    tick BUY can't re-notify. Every ready intent is sent (the 'every buy & sell' policy);
-    the ones the bot can't place itself — surveillance quarantine, insufficient cash, or a
-    phantom sell — are flagged 'act manually', which is the whole point of the feed.
-    Best-effort: genuinely-unsent rows are retried next tick; a WhatsApp outage never
-    blocks trading (the caller also wraps this)."""
-    if not whatsapp.configured() or not ready:
+      * status 'open'            → the bot placed a real order (heads-up).
+      * status 'error'/'rejected'→ the bot couldn't place it (e.g. AB4036) → 'do it
+                                    manually', which is the point of the feed.
+
+    Deduped per order-event via real_signals (key 'order:<id>:<status>'); genuinely-unsent
+    rows retry next tick. A 1-day window bounds the first-deploy backlog. Best-effort — a
+    WhatsApp outage never blocks the tick (the caller also wraps this)."""
+    if not whatsapp.configured():
         return 0
-    q = quarantined or set()
-    bq = broker_qty or {}
+    rows = await fetch(
+        """
+        SELECT id, symbol, side, qty, requested_price::float8 AS price, status, error, reason
+        FROM real_orders
+        WHERE portfolio_id = $1
+          AND requested_at >= now() - interval '1 day'
+          AND status IN ('open', 'error', 'rejected')
+        ORDER BY requested_at
+        """,
+        portfolio_id,
+    )
+    if not rows:
+        return 0
     now_str = now_ist().strftime("%H:%M IST")
     sent = 0
-    blocked = False  # circuit breaker: once a broadcast delivers 0 this tick (gateway
-                     # down / no targets), stop attempting further sends so per-send
-                     # timeouts can't stall the 60s tick — unsent rows retry next tick.
-    for _key, trade in ready:
-        sig_key = _logical_key_from_trade(trade)
-        prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", sig_key)
+    blocked = False  # circuit breaker: once a broadcast delivers 0 this tick, stop
+                     # attempting sends so per-send timeouts can't stall the 60s tick.
+    for o in rows:
+        key = f"order:{o['id']}:{o['status']}"
+        prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
         if prev and prev["sent_ok"]:
             continue  # already delivered — retry only genuinely-unsent rows
-
-        sym = trade["symbol"]
-        side = str(trade["side"]).upper()
-        placeable, note = True, None
-        if side == "BUY":
-            if sym in q:
-                placeable, note = False, "surveillance/cautionary block (e.g. AB4036)"
-            elif (available_cash is not None
-                  and int(trade["qty"]) * float(trade["price"]) * 1.004 > available_cash):
-                placeable, note = False, "insufficient bot cash"
-        else:
-            if int(bq.get(sym, 0)) <= 0:
-                placeable, note = False, "broker holds none of it"
-
+        placeable = o["status"] == "open"
         delivered = 0
         if not blocked:
-            text = whatsapp.format_signal(
-                trade, portfolio_name=portfolio.name, placeable=placeable, note=note,
-                now_ist_str=now_str)
+            text = whatsapp.format_order_event(dict(o), now_ist_str=now_str)
             delivered = await whatsapp.broadcast(text)
             if delivered == 0:
-                blocked = True  # gateway/targets unusable this tick — record & move on
+                blocked = True
         await conn_execute(
             """
             INSERT INTO real_signals
@@ -648,8 +721,58 @@ async def emit_signals(
               SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
                   targets = GREATEST(real_signals.targets, EXCLUDED.targets)
             """,
-            sig_key, portfolio.id, sym, side, int(trade["qty"]), float(trade["price"]),
-            trade.get("reason"), placeable, note, delivered > 0, delivered,
+            key, portfolio_id, o["symbol"], o["side"], int(o["qty"]), float(o["price"] or 0),
+            o["reason"], placeable, (None if placeable else (o["error"] or "rejected")),
+            delivered > 0, delivered,
+        )
+        if delivered > 0:
+            sent += 1
+    return sent
+
+
+async def emit_quarantine_signals(portfolio_id: int, skips: list[dict]) -> int:
+    """WhatsApp a 'buy it manually' nudge for BUY signals the bot SKIPPED because the symbol
+    is benched (surveillance/AB4036). This is the ongoing companion to emit_order_signals:
+    the bot won't fire a doomed order, but you still get pinged each time the strategy
+    re-signals a benched name, so you can act on it by hand.
+
+    Deduped per distinct signal via real_signals (key 'skip:<intent_key>'). The intent key
+    already encodes date|symbol|side|reason, so this is one ping per genuine signal — not one
+    per 60s tick. Best-effort, with the same 0-delivery circuit breaker as emit_order_signals."""
+    if not whatsapp.configured() or not skips:
+        return 0
+    # Bench reason (e.g. AB4036) for the symbols we're about to report — for the message text.
+    syms = list({s["symbol"] for s in skips})
+    qrows = await fetch(
+        "SELECT symbol, reason_code FROM real_quarantine WHERE symbol = ANY($1::text[])", syms)
+    reason_by_sym = {r["symbol"]: r["reason_code"] for r in qrows}
+    now_str = now_ist().strftime("%H:%M IST")
+    sent = 0
+    blocked = False
+    for s in skips:
+        key = f"skip:{s['intent_key']}"
+        prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
+        if prev and prev["sent_ok"]:
+            continue  # this exact signal already nudged — don't repeat
+        delivered = 0
+        if not blocked:
+            text = whatsapp.format_quarantine_skip(
+                s, reason_code=reason_by_sym.get(s["symbol"]), now_ist_str=now_str)
+            delivered = await whatsapp.broadcast(text)
+            if delivered == 0:
+                blocked = True
+        await conn_execute(
+            """
+            INSERT INTO real_signals
+                (signal_key, portfolio_id, symbol, side, qty, price, reason, placeable, note, sent_ok, targets)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, FALSE, $8, $9, $10)
+            ON CONFLICT (signal_key) DO UPDATE
+              SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
+                  targets = GREATEST(real_signals.targets, EXCLUDED.targets)
+            """,
+            key, portfolio_id, s["symbol"], s["side"], int(s["qty"]), float(s["price"] or 0),
+            s.get("reason"), f"benched:{reason_by_sym.get(s['symbol']) or 'surveillance'}",
+            delivered > 0, delivered,
         )
         if delivered > 0:
             sent += 1
@@ -708,6 +831,12 @@ async def tick() -> None:
     # account's net value for SIP-deposit detection, so it must be current.
     held = await sync_holdings(client)
     funds = await sync_funds(client)
+    # Tag any manual (app/web) trades from the account order book — always, so your
+    # by-hand trades are captured whether the bot is ON or OFF. Never break the tick on it.
+    try:
+        await sync_manual_trades(client)
+    except Exception:  # noqa: BLE001
+        log.exception("manual-trade tag failed")
 
     # 2. Master switch.
     if not await bot_enabled():
@@ -798,18 +927,11 @@ async def tick() -> None:
                 log.info("scan entries waiting for scan time (provisional, not placed)",
                          extra={"portfolio_id": p.id, "count": provisional, "now": now_hhmm})
 
-            total_placed += await place_new_orders(
+            placed_n, quarantine_skips = await place_new_orders(
                 client, p, sym_map, ready, available_cash=funds.get("available_cash"),
                 engine_target_qty=engine_target_qty, broker_qty=broker_qty,
                 quarantined=quarantined)
-
-            # Forward every ready signal to the WhatsApp groups (once), flagging the
-            # ones the bot can't place itself so they can be actioned by hand (e.g.
-            # AB4036 surveillance stocks). Never let a WhatsApp issue break the tick.
-            try:
-                await emit_signals(p, ready, quarantined, broker_qty, funds.get("available_cash"))
-            except Exception:  # noqa: BLE001
-                log.exception("whatsapp signal emit failed", extra={"portfolio_id": p.id})
+            total_placed += placed_n
 
             # Surface signals too old to place, so a skipped entry is visible
             # rather than looking like a silent miss.
@@ -822,6 +944,15 @@ async def tick() -> None:
 
             # Reconcile any still-open orders against the broker.
             await reconcile_open_orders(client, p.id)
+
+            # WhatsApp the bot's ACTUAL order events (placed / rejected) — from real_orders,
+            # not the strategy replay — plus a 'buy it manually' nudge for BUYs skipped
+            # because their symbol is benched. Never let a WhatsApp issue break the tick.
+            try:
+                await emit_order_signals(p.id)
+                await emit_quarantine_signals(p.id, quarantine_skips)
+            except Exception:  # noqa: BLE001
+                log.exception("whatsapp order-signal emit failed", extra={"portfolio_id": p.id})
         except Exception:  # noqa: BLE001
             log.exception("live portfolio tick failed",
                           extra={"portfolio_id": p.id, "portfolio_name": p.name})
