@@ -43,6 +43,27 @@ def engine_symbol_root(broker_symbol: str | None) -> str:
     return _SERIES_SUFFIX_RE.sub("", broker_symbol or "")
 
 
+def symbol_lag_days(universe_latest: datetime | None, symbol_latest: datetime | None) -> int:
+    """How many days a HELD symbol's freshest candle lags the freshest candle anywhere in
+    the universe. Pure — the corporate-action detector for suspensions / delistings / mergers.
+
+    Comparing against the newest bar *in the universe* (not wall-clock) makes this both
+    calendar-agnostic and outage-proof: a normally-trading symbol lags ~0; weekends and
+    holidays advance neither side; and a platform-wide data outage staleness the universe
+    too, so the lag stays ~0 and nothing is falsely flagged. Only a symbol that specifically
+    stops pricing while the rest of the market trades on grows a lag — which is exactly the
+    corporate-action signature (halt / suspension / delisting / merger completion).
+
+      * symbol_latest is None (held but never priced) → a large sentinel (definitely inactive).
+      * universe_latest is None (no candles at all) → 0 (nothing to compare; never flag).
+    """
+    if universe_latest is None:
+        return 0
+    if symbol_latest is None:
+        return 10 ** 6
+    return max(0, (universe_latest - symbol_latest).days)
+
+
 def surveillance_reject_code(error_text: str | None) -> str | None:
     """Return the broker rejection code IF an order error is a surveillance/cautionary block
     we should quarantine on (e.g. ``AB4036``), else ``None``.

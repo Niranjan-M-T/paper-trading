@@ -148,3 +148,17 @@ def format_quarantine_skip(item: dict, *, reason_code: str | None, now_ist_str: 
     return (f"🚫 Live bot wants {side}  {qty} × {sym}  @ ₹{price:,.2f}\n"
             f"Skipped — on the surveillance bench{code}, the broker blocks it.\n"
             f"Buy it manually if you want it.  ·  {now_ist_str}")
+
+
+def format_suspension_alert(symbol: str, *, days_lag: int, qty: int, now_ist_str: str) -> str:
+    """Build the WhatsApp text for a HELD position that has stopped pricing — the
+    corporate-action heads-up (suspension / delisting / merger in progress).
+
+    The bot can't exit or manage a scrip that isn't trading, and a merger/delisting needs a
+    human decision (tender the shares, take the acquirer's stock or the cash), so this is a
+    pure 'go handle this by hand' nudge — never an automated trade."""
+    return (f"⚠️ Heads up — you HOLD {qty} × {symbol}, but it hasn't priced in ~{days_lag} "
+            f"day(s) while the rest of the market has.\n"
+            f"That usually means a suspension, delisting, or a merger/M&A in progress. The bot "
+            f"can't manage or exit a scrip that isn't trading — check the corporate action and "
+            f"handle it manually.  ·  {now_ist_str}")

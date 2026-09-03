@@ -142,6 +142,32 @@ didn't place) and the `-BE`/`-BZ` adoption fix so INOXGREEN-style surveillance h
 managed. Open item: reconstruct the true opening from `real_orders` (bot-only; blind to
 pre-tagger manual trades and cash moves) as a sanity check on the ₹18k assumption.
 
+## 2026-09-03 — Corporate-action handling (Track A, increment 1)
+
+Owner flagged that the platform doesn't handle splits / M&A / delisting, and asked whether
+the algo's "strategy creator" already covers it. Findings (grounded in the algo tree):
+- **Splits/bonuses** are handled in the algo *backtest* at the data layer (`run_scenarios.py`
+  `auto_adjust=True`) + a ±50% daily-return clip on the universe index. The live/paper
+  platform stores **raw** prices (`yf_provider auto_adjust=False`, drops the Splits/Dividends
+  columns) → a split corrupts `volume_avg20` / 90d-high / ATR and a held name's exit basis.
+- **Corporate EVENTS** (auditor resignation, insolvency, fraud, SEBI orders, suspension/
+  delisting, results blackout) — the algo's **Round 62 "TIER-1 corporate-event features"**
+  (`news_data.py` NSE scraper + `engine_v2` event gates) builds strategies **S560–S572** on
+  S505/S525. But it's experimental (veto effect "near-zero" until 150 symbols), needs
+  `event_features=`, and the live champion is still S404. **Paper-trading has none of it**
+  (grep: `event_features`/`news_data`/`classify_event` = 0 hits — ported only through R59).
+- **M&A share-conversion** is not handled anywhere.
+
+So the fix splits into **Track A** (price/position integrity — independent) and **Track B**
+(port Round 62 event overlay — follows the S505→S525 migration). Shipped Track-A increment 1:
+a **held-position staleness alert** — `real_executor.symbol_lag_days` (pure, universe-relative
+so outages/weekends never false-trigger) + `real_trader.emit_suspension_alerts` (always-on,
+alert-only, deduped per symbol/day in `real_signals`, `SUSPEND_STALE_DAYS` default 3) →
+`whatsapp.format_suspension_alert` "you HOLD N×SYM, hasn't priced in ~Kd, handle it manually".
+Chose alert-first (zero false-positive trade suppression) over auto-benching. **Next:** a
+`corporate_actions` table + split back-adjustment of stored candles, then position-basis
+re-adoption; Track B later. Tests: 19/19 in `test_whatsapp_signals.py`.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

@@ -205,6 +205,29 @@ net-value SIP detector booked a holdings rally or a mutual-fund inflow as a phan
 Genuine later top-ups: insert a `real_deposits` row by hand. `metrics.days_live()` also
 drives a "Nd running" counter on every dashboard card.
 
+## Corporate-action guard (held-position staleness)
+
+The live/paper data pipeline stores **raw, unadjusted** OHLCV (`yf_provider` uses
+`auto_adjust=False` and drops the `Stock Splits`/`Dividends` columns), unlike the algo
+backtest (`auto_adjust=True`). So corporate actions aren't yet reconciled in prices — a
+split/bonus leaves a discontinuity in the rolling features (`volume_avg20`, the 90-day
+high, ATR), and a merger/delisting silently strands a held position. First increment
+shipped: a **held-position staleness alert** (alert-only; it never benches or trades).
+
+- Each tick (always-on, bot ON or OFF) `real_trader.emit_suspension_alerts()` flags a HELD
+  symbol whose freshest 5m candle lags the freshest bar **anywhere in the universe** by
+  ≥ `SUSPEND_STALE_DAYS` (default 3). The lag is **universe-relative** (`real_executor.
+  symbol_lag_days`), so weekends, holidays and platform-wide data outages never trip it —
+  only a symbol that specifically halts while the market trades on does. That's the
+  signature of a suspension / delisting / merger-in-progress.
+- It WhatsApps "⚠️ you HOLD N × SYM, hasn't priced in ~Kd … handle it manually"
+  (`whatsapp.format_suspension_alert`), deduped once per (symbol, day) via `real_signals`
+  (`suspend:<symbol>:<date>`, `side='INFO'`). Requires WhatsApp configured; a no-op otherwise.
+- **Not yet done (follow-ups):** a `corporate_actions` table + back-adjusting stored history
+  on a split/bonus (fixes the false entries/exits), position-basis re-adoption after a split,
+  and porting the algo's Round 62 event overlay (`news_data.py`, S560–S572) for fundamental
+  event risk. See the decision log.
+
 ## Testing the live path
 
 - `python -m tools.test_place_order` — places and immediately cancels a tiny,

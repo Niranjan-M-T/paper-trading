@@ -20,7 +20,9 @@ os.environ.setdefault("SESSION_SECRET", "test-secret-do-not-use")
 from datetime import datetime, timedelta, timezone  # noqa: E402
 
 from src.core import metrics, whatsapp  # noqa: E402
-from src.engine.real_executor import engine_symbol_root  # noqa: E402
+from src.engine.real_executor import (  # noqa: E402
+    _logical_key_from_trade, engine_symbol_root, intent_key, symbol_lag_days,
+)
 
 
 # ---------- days-running counter ----------
@@ -102,6 +104,70 @@ def test_format_quarantine_skip_without_code():
         {"symbol": "XYZ", "side": "BUY", "qty": 1, "price": 10.0},
         reason_code=None, now_ist_str="10:00 IST")
     assert "XYZ" in txt and "manually" in txt.lower()
+
+
+# ---------- corporate-action guard: held-position staleness ----------
+
+def _dt(y, mo, d, h=15, mi=25):
+    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+
+
+def test_symbol_lag_days_fresh_is_zero():
+    now = _dt(2026, 8, 20)
+    assert symbol_lag_days(now, now) == 0                       # trades in step with market
+    assert symbol_lag_days(now, _dt(2026, 8, 19)) == 1          # one day behind
+
+
+def test_symbol_lag_days_flags_a_halt():
+    # Symbol last priced Aug 12; universe fresh to Aug 20 → 8-day lag (suspension/merger).
+    assert symbol_lag_days(_dt(2026, 8, 20), _dt(2026, 8, 12)) == 8
+
+
+def test_symbol_lag_days_never_priced_is_large():
+    assert symbol_lag_days(_dt(2026, 8, 20), None) >= 1000
+
+
+def test_symbol_lag_days_outage_and_edge_cases_dont_flag():
+    # Whole universe stale (platform outage) → universe_latest is old too → lag stays ~0.
+    assert symbol_lag_days(_dt(2026, 8, 12), _dt(2026, 8, 12)) == 0
+    assert symbol_lag_days(None, _dt(2026, 8, 12)) == 0         # no candles anywhere → never flag
+    # A symbol somehow ahead of the universe max clamps to 0 (never negative).
+    assert symbol_lag_days(_dt(2026, 8, 12), _dt(2026, 8, 20)) == 0
+
+
+def test_format_suspension_alert_is_a_manual_nudge():
+    txt = whatsapp.format_suspension_alert("INOXGREEN", days_lag=6, qty=5, now_ist_str="15:25 IST")
+    assert "INOXGREEN" in txt and "5" in txt and "6" in txt
+    assert "manually" in txt.lower()
+    assert "HOLD" in txt
+
+
+# ---------- regression: benched-skip nudge must NOT spam every tick ----------
+
+def _skip_trade(price, time, qty):
+    # Same logical action (date·symbol·side·reason), only the live price/time/qty wiggle.
+    return {"date": "2026-09-01", "time": time, "symbol": "INOXGREEN", "side": "BUY",
+            "qty": qty, "price": price, "reason": "entry_scan_10:00_drop_-3%"}
+
+
+def test_benched_skip_dedup_key_is_stable_across_ticks():
+    # The INOXGREEN-every-minute spam: emit_quarantine_signals must dedup on the price/time-
+    # free LOGICAL key, so the same benched signal at 10:41/10:42/10:43 collapses to one nudge.
+    a = _logical_key_from_trade(_skip_trade(161.67, "10:41", 11))
+    b = _logical_key_from_trade(_skip_trade(160.56, "10:42", 11))
+    c = _logical_key_from_trade(_skip_trade(161.25, "10:43", 12))
+    assert a == b == c                                   # one logical signal → one dedup key
+    assert "161" not in a and "10:41" not in a           # price/time are NOT in the key
+    # The full intent_key DOES carry price/time — deduping on IT is what spammed.
+    assert len({intent_key(_skip_trade(161.67, "10:41", 11)),
+                intent_key(_skip_trade(160.56, "10:42", 11))}) == 2
+
+
+def test_benched_skip_distinct_reasons_still_nudge_separately():
+    scan = _logical_key_from_trade(_skip_trade(161.67, "10:41", 11))
+    pyr = _logical_key_from_trade({**_skip_trade(155.0, "11:30", 11),
+                                   "reason": "pyramid_close_-8%_lvl1"})
+    assert scan != pyr                                   # a genuinely different action still pings
 
 
 # ---------- gateway is OFF by default (no accidental network sends) ----------

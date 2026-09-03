@@ -36,6 +36,7 @@ from src.core.time import IST, is_market_open, now_ist, seconds_until_market_ope
 from src.core.universe import load_universe
 from src.core import whatsapp
 from src.engine.real_executor import (
+    _logical_key_from_trade,
     count_stale_intents,
     engine_symbol_root,
     entry_bars_agree,
@@ -45,6 +46,7 @@ from src.engine.real_executor import (
     select_new_intents,
     sip_deposit_amount,
     surveillance_reject_code,
+    symbol_lag_days,
 )
 from src.engine.replay import (
     PortfolioRow,
@@ -563,7 +565,11 @@ async def place_new_orders(
                 log.info("skip BUY — symbol quarantined (surveillance/cautionary block)",
                          extra={"symbol": sym, "reason": trade.get("reason")})
                 quarantine_skips.append({
-                    "intent_key": key, "symbol": sym, "side": trade["side"],
+                    # Dedup on the PRICE/TIME-FREE logical key, not the full intent_key —
+                    # otherwise the wiggling price/time re-notifies every 60s tick (the
+                    # INOXGREEN-every-minute spam). One nudge per distinct signal per day.
+                    "logical_key": _logical_key_from_trade(trade),
+                    "symbol": sym, "side": trade["side"],
                     "qty": int(trade["qty"]), "price": float(trade["price"]),
                     "reason": trade.get("reason"),
                 })
@@ -736,9 +742,10 @@ async def emit_quarantine_signals(portfolio_id: int, skips: list[dict]) -> int:
     the bot won't fire a doomed order, but you still get pinged each time the strategy
     re-signals a benched name, so you can act on it by hand.
 
-    Deduped per distinct signal via real_signals (key 'skip:<intent_key>'). The intent key
-    already encodes date|symbol|side|reason, so this is one ping per genuine signal — not one
-    per 60s tick. Best-effort, with the same 0-delivery circuit breaker as emit_order_signals."""
+    Deduped per distinct signal via real_signals on the PRICE/TIME-FREE logical key
+    ('skip:<date|symbol|side|reason>') — NOT the full intent_key, whose wiggling price/time
+    would re-notify every 60s tick (the INOXGREEN-every-minute spam). So it's one ping per
+    genuine signal per day. Best-effort, with the same 0-delivery circuit breaker."""
     if not whatsapp.configured() or not skips:
         return 0
     # Bench reason (e.g. AB4036) for the symbols we're about to report — for the message text.
@@ -750,10 +757,10 @@ async def emit_quarantine_signals(portfolio_id: int, skips: list[dict]) -> int:
     sent = 0
     blocked = False
     for s in skips:
-        key = f"skip:{s['intent_key']}"
+        key = f"skip:{s['logical_key']}"
         prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
         if prev and prev["sent_ok"]:
-            continue  # this exact signal already nudged — don't repeat
+            continue  # this signal already nudged today — don't repeat every tick
         delivered = 0
         if not blocked:
             text = whatsapp.format_quarantine_skip(
@@ -773,6 +780,75 @@ async def emit_quarantine_signals(portfolio_id: int, skips: list[dict]) -> int:
             key, portfolio_id, s["symbol"], s["side"], int(s["qty"]), float(s["price"] or 0),
             s.get("reason"), f"benched:{reason_by_sym.get(s['symbol']) or 'surveillance'}",
             delivered > 0, delivered,
+        )
+        if delivered > 0:
+            sent += 1
+    return sent
+
+
+async def emit_suspension_alerts() -> int:
+    """WhatsApp a heads-up when a HELD position stops pricing — the corporate-action guard
+    (suspension / delisting / merger-in-progress). Account-wide and ALWAYS-ON (fires whether
+    the bot is ON or OFF), because a held name getting acquired or halted needs a human
+    decision regardless of the master switch.
+
+    A symbol is flagged when its freshest 5m candle lags the freshest bar ANYWHERE in the
+    universe by >= settings.suspend_stale_days (real_executor.symbol_lag_days — the lag is
+    universe-relative, so weekends, holidays and platform-wide data outages never trip it;
+    only a symbol that specifically halts while the market trades on does). Alert-only: it
+    never benches or trades. Deduped once per (symbol, day) via real_signals
+    ('suspend:<symbol>:<date>'); best-effort with the usual 0-delivery circuit breaker."""
+    if not whatsapp.configured():
+        return 0
+    held = await fetch("SELECT symbol, qty FROM real_holdings WHERE qty > 0")
+    if not held:
+        return 0
+    uni = await fetchrow("SELECT MAX(ts) AS t FROM candles WHERE interval = $1", CANDLE_INTERVAL)
+    universe_latest = uni["t"] if uni else None
+    if universe_latest is None:
+        return 0
+    # Held broker rows → engine roots (strip the -EQ/-BE/… series suffix), summing qty.
+    qty_by_root: dict[str, int] = {}
+    for h in held:
+        r = engine_symbol_root(h["symbol"])
+        qty_by_root[r] = qty_by_root.get(r, 0) + int(h["qty"] or 0)
+    roots = sorted(qty_by_root)
+    rows = await fetch(
+        "SELECT symbol, MAX(ts) AS t FROM candles WHERE interval = $1 AND symbol = ANY($2::text[]) "
+        "GROUP BY symbol",
+        CANDLE_INTERVAL, roots,
+    )
+    latest_by_sym = {r["symbol"]: r["t"] for r in rows}
+    today = now_ist().date().isoformat()
+    now_str = now_ist().strftime("%H:%M IST")
+    sent = 0
+    blocked = False
+    for sym in roots:
+        lag = symbol_lag_days(universe_latest, latest_by_sym.get(sym))
+        if lag < settings.suspend_stale_days:
+            continue
+        key = f"suspend:{sym}:{today}"
+        prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
+        if prev and prev["sent_ok"]:
+            continue  # already alerted for this symbol today
+        delivered = 0
+        if not blocked:
+            text = whatsapp.format_suspension_alert(
+                sym, days_lag=lag, qty=qty_by_root.get(sym, 0), now_ist_str=now_str)
+            delivered = await whatsapp.broadcast(text)
+            if delivered == 0:
+                blocked = True
+        await conn_execute(
+            """
+            INSERT INTO real_signals
+                (signal_key, portfolio_id, symbol, side, qty, price, reason, placeable, note, sent_ok, targets)
+            VALUES ($1, NULL, $2, 'INFO', $3, 0, $4, FALSE, $5, $6, $7)
+            ON CONFLICT (signal_key) DO UPDATE
+              SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
+                  targets = GREATEST(real_signals.targets, EXCLUDED.targets)
+            """,
+            key, sym, qty_by_root.get(sym, 0), f"held position stale {lag}d",
+            f"suspension/delisting/merger? lag {lag}d", delivered > 0, delivered,
         )
         if delivered > 0:
             sent += 1
@@ -837,6 +913,12 @@ async def tick() -> None:
         await sync_manual_trades(client)
     except Exception:  # noqa: BLE001
         log.exception("manual-trade tag failed")
+    # Corporate-action guard — alert if a HELD position has stopped pricing (suspension /
+    # delisting / merger). Always-on (matters bot ON or OFF) and alert-only; never breaks the tick.
+    try:
+        await emit_suspension_alerts()
+    except Exception:  # noqa: BLE001
+        log.exception("suspension alert check failed")
 
     # 2. Master switch.
     if not await bot_enabled():

@@ -80,6 +80,12 @@ class Settings:
     # so it can be re-enabled if Angel ever exposes a segregated equity-cash figure.
     deposit_autodetect: bool
 
+    # Corporate-action guard: WhatsApp-alert when a HELD position stops pricing this many
+    # days behind the freshest bar in the universe (a suspension / delisting / merger). The
+    # lag is measured vs the newest universe bar, not wall-clock, so weekends/holidays and
+    # platform-wide data outages never trip it — only a symbol that specifically halts does.
+    suspend_stale_days: int
+
     # Market-data source for the live poller: 'angel' (default, per-symbol Angel
     # calls) or 'yfinance' (one batched Yahoo download for the whole universe —
     # removes the Angel historical-API rate-limit storm). Validated 2026-07-01 to
@@ -180,6 +186,7 @@ def load_settings() -> Settings:
         real_trader_intent_max_age_days=int(_opt("REAL_TRADER_INTENT_MAX_AGE_DAYS", "1")),
         real_opening_capital=float(_opt("REAL_OPENING_CAPITAL", "18000")),
         deposit_autodetect=_opt("DEPOSIT_AUTODETECT", "false").strip().lower() in ("1", "true", "yes", "on"),
+        suspend_stale_days=int(_opt("SUSPEND_STALE_DAYS", "3")),
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
         yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),
