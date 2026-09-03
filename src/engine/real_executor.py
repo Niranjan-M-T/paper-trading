@@ -64,6 +64,31 @@ def symbol_lag_days(universe_latest: datetime | None, symbol_latest: datetime | 
     return max(0, (universe_latest - symbol_latest).days)
 
 
+def cumulative_split_factor(bar_date: date, actions) -> float:
+    """The back-adjustment divisor for a bar dated `bar_date`, given a symbol's corporate
+    actions. Pure — the core of split/bonus price adjustment.
+
+    `actions` is an iterable of (ex_date, ratio): the first day trading in post-action price
+    space, and the shares-per-old-share ratio (5.0 for a 5:1 split, 2.0 for a 1:1 bonus). A
+    bar STRICTLY BEFORE an ex-date is in the old, pre-split price space, so it is divided by
+    that ratio (and its volume multiplied) to line up with today's real price. Bars on/after
+    every ex-date get factor 1.0 — they already ARE the current price, so orders still place
+    at the real number. Multiple splits compound (a bar before both divides by both).
+
+    Mirrors yfinance auto_adjust=True (back-adjust so the latest bar is the real price), which
+    is what the algo backtest uses — so the live/paper series lines up with what was validated.
+    """
+    f = 1.0
+    for ex_date, ratio in actions:
+        try:
+            r = float(ratio)
+        except (TypeError, ValueError):
+            continue
+        if r > 0 and bar_date < ex_date:
+            f *= r
+    return f
+
+
 def surveillance_reject_code(error_text: str | None) -> str | None:
     """Return the broker rejection code IF an order error is a surveillance/cautionary block
     we should quarantine on (e.g. ``AB4036``), else ``None``.

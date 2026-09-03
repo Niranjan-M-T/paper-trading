@@ -223,10 +223,22 @@ shipped: a **held-position staleness alert** (alert-only; it never benches or tr
 - It WhatsApps "⚠️ you HOLD N × SYM, hasn't priced in ~Kd … handle it manually"
   (`whatsapp.format_suspension_alert`), deduped once per (symbol, day) via `real_signals`
   (`suspend:<symbol>:<date>`, `side='INFO'`). Requires WhatsApp configured; a no-op otherwise.
-- **Not yet done (follow-ups):** a `corporate_actions` table + back-adjusting stored history
-  on a split/bonus (fixes the false entries/exits), position-basis re-adoption after a split,
-  and porting the algo's Round 62 event overlay (`news_data.py`, S560–S572) for fundamental
-  event risk. See the decision log.
+**Split / bonus back-adjustment (Track A #2, shipped).** A `corporate_actions` table (sql/014:
+`symbol, ex_date, action_type, ratio, active`) drives a **read-time, non-destructive**
+adjustment: `engine/corporate_actions.py` (`load_active_actions` + `adjust_frame`, using the
+pure `real_executor.cumulative_split_factor`) divides a bar's price by the compounded ratio of
+every split whose ex-date is *after* it (and multiplies its volume), wired into
+`replay.load_candles_window` — so both live and paper see a continuous series across a split
+(no false 90d-high dip, no phantom volume spike). Stored candles stay **raw** (orders still
+place at the real current price), the table is empty by default (zero cost until a split is
+recorded), and a wrong row is reversed by flipping `active`. Manage it with
+`python -m tools.corporate_actions` (`--detect` pulls yfinance `.splits` for the universe,
+`--add`, `--list`, `--disable`); mirrors the algo backtest's `auto_adjust=True`.
+
+- **Not yet done (follow-ups):** position-basis re-adoption after a split (a held name's
+  `avg_price`/`entry_atr` come from `trades`, still pre-split — live is partly covered by
+  broker-authoritative adoption), auto-scheduling `--detect` (weekly), and porting the algo's
+  Round 62 event overlay (`news_data.py`, S560–S572) for fundamental event risk (Track B).
 
 ## Testing the live path
 

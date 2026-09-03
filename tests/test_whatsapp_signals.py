@@ -17,11 +17,12 @@ os.environ.setdefault("ANGEL_TOTP_SECRET", "JBSWY3DPEHPK3PXP")
 os.environ.setdefault("DASHBOARD_PASSWORD", "test")
 os.environ.setdefault("SESSION_SECRET", "test-secret-do-not-use")
 
-from datetime import datetime, timedelta, timezone  # noqa: E402
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
 
 from src.core import metrics, whatsapp  # noqa: E402
 from src.engine.real_executor import (  # noqa: E402
-    _logical_key_from_trade, engine_symbol_root, intent_key, symbol_lag_days,
+    _logical_key_from_trade, cumulative_split_factor, engine_symbol_root, intent_key,
+    symbol_lag_days,
 )
 
 
@@ -168,6 +169,31 @@ def test_benched_skip_distinct_reasons_still_nudge_separately():
     pyr = _logical_key_from_trade({**_skip_trade(155.0, "11:30", 11),
                                    "reason": "pyramid_close_-8%_lvl1"})
     assert scan != pyr                                   # a genuinely different action still pings
+
+
+# ---------- split / bonus back-adjustment factor ----------
+
+def test_split_factor_no_actions_is_one():
+    assert cumulative_split_factor(date(2024, 1, 1), []) == 1.0
+
+
+def test_split_factor_divides_only_pre_ex_date_bars():
+    acts = [(date(2024, 10, 28), 5.0)]                   # 5:1 split, ex-date Oct 28
+    assert cumulative_split_factor(date(2024, 10, 27), acts) == 5.0   # before → ÷5 (price), ×5 (vol)
+    assert cumulative_split_factor(date(2024, 10, 28), acts) == 1.0   # on ex-date → real price
+    assert cumulative_split_factor(date(2024, 11, 1), acts) == 1.0    # after → untouched
+
+
+def test_split_factor_compounds_multiple_actions():
+    acts = [(date(2023, 6, 1), 2.0), (date(2024, 10, 28), 5.0)]       # a 2:1 then a 5:1
+    assert cumulative_split_factor(date(2023, 1, 1), acts) == 10.0    # before both → ×2 ×5
+    assert cumulative_split_factor(date(2024, 1, 1), acts) == 5.0     # between → only the later 5:1
+    assert cumulative_split_factor(date(2025, 1, 1), acts) == 1.0     # after both → 1
+
+
+def test_split_factor_ignores_bad_ratios():
+    acts = [(date(2024, 10, 28), 0.0), (date(2024, 10, 28), None), (date(2024, 10, 28), -3.0)]
+    assert cumulative_split_factor(date(2020, 1, 1), acts) == 1.0     # 0 / None / negative skipped
 
 
 # ---------- gateway is OFF by default (no accidental network sends) ----------

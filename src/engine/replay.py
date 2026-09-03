@@ -25,6 +25,7 @@ import pandas as pd
 
 from src.core.db import conn, fetchrow
 from src.core.time import IST, now_ist
+from src.engine.corporate_actions import adjust_frame, load_active_actions
 from src.engine.universe_index import build_from_candles
 from src.engine.v2_engine import (
     ChargeConfigV2,
@@ -105,7 +106,14 @@ async def load_candles_window(
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_convert(IST)
     df["date"] = df["timestamp"].dt.date
     df["time"] = df["timestamp"].dt.strftime("%H:%M")
-    return df.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    df = df.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    # Back-adjust for recorded splits/bonuses (read-time, non-destructive) so rolling
+    # features and held-position bases stay continuous across a corporate action. A no-op
+    # with zero cost when corporate_actions has nothing for these symbols (sql/014).
+    actions = await load_active_actions(list(symbols))
+    if actions:
+        df = adjust_frame(df, actions)
+    return df
 
 
 async def load_index_close(symbol: str, interval: str = "1d") -> pd.Series:

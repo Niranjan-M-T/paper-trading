@@ -164,9 +164,23 @@ a **held-position staleness alert** — `real_executor.symbol_lag_days` (pure, u
 so outages/weekends never false-trigger) + `real_trader.emit_suspension_alerts` (always-on,
 alert-only, deduped per symbol/day in `real_signals`, `SUSPEND_STALE_DAYS` default 3) →
 `whatsapp.format_suspension_alert` "you HOLD N×SYM, hasn't priced in ~Kd, handle it manually".
-Chose alert-first (zero false-positive trade suppression) over auto-benching. **Next:** a
-`corporate_actions` table + split back-adjustment of stored candles, then position-basis
-re-adoption; Track B later. Tests: 19/19 in `test_whatsapp_signals.py`.
+Chose alert-first (zero false-positive trade suppression) over auto-benching. Tests: 19/19.
+
+**Same day, increment 2 — split/bonus back-adjustment (commit pending).** Fixes the false
+entries/exits a split causes. `corporate_actions` table (sql/014); a **read-time,
+non-destructive** adjustment in `engine/corporate_actions.py` (`adjust_frame` +
+`load_active_actions`, pure core `real_executor.cumulative_split_factor`) wired into
+`replay.load_candles_window` — divides a bar's price by the compounded ratio of every split
+ex-dated after it (volume ×). Chose read-time over mutating stored candles: reversible
+(`active` flag), no idempotency/late-backfill hazard, orders still place at the raw current
+price, and it's a zero-cost no-op until a split is recorded. `tools/corporate_actions.py`
+(`--detect` via yfinance `.splits`, `--add`, `--list`, `--disable`). Mirrors the backtest's
+`auto_adjust=True`. Also fixed the **benched-skip WhatsApp spam** (commit 60436e5): the
+Option-B nudge deduped on the full `intent_key` (carries live price/time) → re-sent every 60s
+tick (owner's INOXGREEN screenshot); now dedups on the price/time-free logical key. Tests: 25/25.
+
+**Still pending:** position-basis re-adoption after a split (`trades`-derived `avg_price`
+stays pre-split); auto-scheduling `--detect`; Track B (port Round 62 events).
 
 ## Prior context (before this log's window)
 
