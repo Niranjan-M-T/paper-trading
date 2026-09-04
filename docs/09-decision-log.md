@@ -179,8 +179,20 @@ price, and it's a zero-cost no-op until a split is recorded. `tools/corporate_ac
 Option-B nudge deduped on the full `intent_key` (carries live price/time) → re-sent every 60s
 tick (owner's INOXGREEN screenshot); now dedups on the price/time-free logical key. Tests: 25/25.
 
-**Still pending:** position-basis re-adoption after a split (`trades`-derived `avg_price`
-stays pre-split); auto-scheduling `--detect`; Track B (port Round 62 events).
+**Same day, increment 3 — position-basis re-adoption after a split (commit pending).**
+Closes the gap increment 2 left: an ADOPTED external holding (`real_external_positions`) whose
+snapshot predates a split still carried the **old** per-share basis, and the engine judges it
+against the now-back-adjusted candles (₹200-space `high_90d`/`atr14`). A ₹1000 basis vs ₹200
+candles makes the ATR stop fire the instant it's adopted and the entry-depth read absurd. Fix:
+pure `real_executor.split_adjust_position(first_seen, qty, avg_price, actions)` (same
+`cumulative_split_factor` divisor as the candles) applied in `real_trader.external_positions_map`
+— a pre-split snapshot of 10 @ ₹1000 becomes 50 @ ₹200. Notional (qty×avg_price) is conserved,
+so the engine's adoption cash debit (`v2_engine` :973) is unchanged; only the per-share basis and
+share count move into today's space — and the adjusted qty now matches the broker's post-split
+holding, so a full exit sells exactly what's held. Native (engine-created) positions needed no
+change: the stateless replay already rebuilds their basis from the back-adjusted candles. Tests: 29/29.
+
+**Still pending:** auto-scheduling `--detect` (weekly); Track B (port Round 62 events + `news_data`).
 
 ## Prior context (before this log's window)
 

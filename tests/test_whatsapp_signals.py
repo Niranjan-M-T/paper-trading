@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from src.core import metrics, whatsapp  # noqa: E402
 from src.engine.real_executor import (  # noqa: E402
     _logical_key_from_trade, cumulative_split_factor, engine_symbol_root, intent_key,
-    symbol_lag_days,
+    split_adjust_position, symbol_lag_days,
 )
 
 
@@ -194,6 +194,34 @@ def test_split_factor_compounds_multiple_actions():
 def test_split_factor_ignores_bad_ratios():
     acts = [(date(2024, 10, 28), 0.0), (date(2024, 10, 28), None), (date(2024, 10, 28), -3.0)]
     assert cumulative_split_factor(date(2020, 1, 1), acts) == 1.0     # 0 / None / negative skipped
+
+
+# ---------- adopted-position basis: back-adjust a pre-split snapshot ----------
+
+def test_split_adjust_position_pre_split_rebases_and_conserves_notional():
+    # 10 shares @ ₹1000 adopted before a 5:1 split → 50 @ ₹200 (candles are ₹200-space).
+    acts = [(date(2024, 10, 28), 5.0)]
+    qty, avg = split_adjust_position(date(2024, 10, 1), 10, 1000.0, acts)
+    assert qty == 50 and avg == 200.0
+    assert qty * avg == 10 * 1000.0        # notional conserved → engine cash debit unchanged
+
+
+def test_split_adjust_position_on_or_after_ex_date_is_untouched():
+    acts = [(date(2024, 10, 28), 5.0)]
+    # Snapshot already in post-split space (broker reports the split shares) → leave it be.
+    assert split_adjust_position(date(2024, 10, 28), 50, 200.0, acts) == (50, 200.0)
+    assert split_adjust_position(date(2024, 11, 5), 50, 200.0, acts) == (50, 200.0)
+
+
+def test_split_adjust_position_no_actions_is_identity():
+    assert split_adjust_position(date(2024, 1, 1), 7, 314.5, []) == (7, 314.5)
+
+
+def test_split_adjust_position_compounds_and_rounds_qty():
+    # A 2:1 then a 5:1, snapshot before both → qty ×10, price ÷10. Odd lot rounds to nearest.
+    acts = [(date(2023, 6, 1), 2.0), (date(2024, 10, 28), 5.0)]
+    qty, avg = split_adjust_position(date(2023, 1, 1), 3, 990.0, acts)
+    assert qty == 30 and avg == 99.0
 
 
 # ---------- gateway is OFF by default (no accidental network sends) ----------

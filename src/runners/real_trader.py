@@ -45,9 +45,11 @@ from src.engine.real_executor import (
     scan_time_of,
     select_new_intents,
     sip_deposit_amount,
+    split_adjust_position,
     surveillance_reject_code,
     symbol_lag_days,
 )
+from src.engine.corporate_actions import load_active_actions
 from src.engine.replay import (
     PortfolioRow,
     load_candles_window,
@@ -209,13 +211,19 @@ async def external_positions_map() -> dict[str, dict]:
         "SELECT symbol, first_seen_date, entry_price::float8 AS entry_price, qty "
         "FROM real_external_positions"
     )
+    # A snapshot recorded before a split carries the OLD per-share basis; the candles the
+    # engine judges it against are back-adjusted at read time, so the snapshot must move into
+    # the same post-split space or the ATR stop fires instantly (₹1000 basis vs ₹200 candles).
+    actions_by_symbol = await load_active_actions([r["symbol"] for r in rows])
     out: dict[str, dict] = {}
     for r in rows:
         d = r["first_seen_date"]
         dstr = d.isoformat() if hasattr(d, "isoformat") else str(d)
-        out.setdefault(dstr, {})[r["symbol"]] = {
-            "qty": int(r["qty"]), "avg_price": float(r["entry_price"]),
-        }
+        qty, avg_price = int(r["qty"]), float(r["entry_price"])
+        acts = actions_by_symbol.get(r["symbol"])
+        if acts and hasattr(d, "isoformat"):
+            qty, avg_price = split_adjust_position(d, qty, avg_price, acts)
+        out.setdefault(dstr, {})[r["symbol"]] = {"qty": qty, "avg_price": avg_price}
     return out
 
 

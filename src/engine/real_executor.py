@@ -89,6 +89,29 @@ def cumulative_split_factor(bar_date: date, actions) -> float:
     return f
 
 
+def split_adjust_position(first_seen: date, qty: int, avg_price: float, actions) -> tuple[int, float]:
+    """Back-adjust an ADOPTED external position's snapshot into post-split price space.
+
+    A broker holding recorded before a split carries the *old* per-share basis (e.g. 10
+    shares @ ₹1000 pre a 5:1). The engine adopts it and then compares that basis against
+    rolling features (90d high, ATR) computed from candles that ARE back-adjusted at read
+    time (`corporate_actions.adjust_frame` → ₹200 space). Mixing a ₹1000 basis with ₹200
+    candles makes the ATR stop fire instantly and the entry-depth read absurd, so the
+    adopted snapshot must live in the same space as the candles it's judged against.
+
+    Same divisor as the candles: a snapshot dated STRICTLY BEFORE an ex-date is pre-split,
+    so ``avg_price`` is divided by the cumulative factor and ``qty`` multiplied — 10 @ ₹1000
+    becomes 50 @ ₹200. Notional (qty × avg_price) is conserved, so the engine's cash debit
+    at adoption is unchanged; only the per-share basis and share count move into today's
+    space (and the qty then matches what the broker actually reports post-split). A snapshot
+    on/after every ex-date has factor 1.0 and is returned untouched.
+    """
+    f = cumulative_split_factor(first_seen, actions)
+    if f == 1.0:
+        return int(qty), float(avg_price)
+    return int(round(qty * f)), float(avg_price) / f
+
+
 def surveillance_reject_code(error_text: str | None) -> str | None:
     """Return the broker rejection code IF an order error is a surveillance/cautionary block
     we should quarantine on (e.g. ``AB4036``), else ``None``.
