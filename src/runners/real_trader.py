@@ -41,6 +41,8 @@ from src.engine.real_executor import (
     engine_symbol_root,
     entry_bars_agree,
     reconcile_sell_qty,
+    cash_flow_residual,
+    reconcile_kind,
     scan_time_elapsed,
     scan_time_of,
     select_new_intents,
@@ -863,6 +865,66 @@ async def emit_suspension_alerts() -> int:
     return sent
 
 
+# Judge a SETTLED funds window (this many minutes old) so the manual-trade tagger has caught up
+# before we decide a cash move is unexplained — avoids a false 'withdrawal?' the instant a manual
+# buy debits cash but its order-book row hasn't been tagged yet.
+RECONCILE_LAG = _timedelta(minutes=3)
+
+
+async def emit_cash_reconcile_alerts() -> None:
+    """Alert on a deposit/withdrawal the books don't know about, so real cash never silently
+    becomes P&L. Compares the two most recent settled real_funds snapshots; if free cash moved
+    by more than settings.reconcile_alert_threshold with no bot/manual trade to explain it,
+    WhatsApp a 'record this' nudge (once per detecting snapshot). Detect-only — never books
+    anything. Always-on (matters bot ON or OFF); the caller guards it so it never breaks the tick."""
+    rows = await fetch(
+        "SELECT id, available_cash::float8 AS cash, as_of FROM real_funds "
+        "WHERE as_of <= now() - $1::interval ORDER BY as_of DESC LIMIT 2",
+        RECONCILE_LAG,
+    )
+    if len(rows) < 2:
+        return
+    cur, prev = rows[0], rows[1]
+    key = f"reconcile:{cur['id']}"
+    prev_sig = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
+    if prev_sig and prev_sig["sent_ok"]:
+        return  # already alerted for this snapshot
+    # Everything that moved cash in the window (bot fills + tagged manual trades), by real value.
+    orders = await fetch(
+        "SELECT side, (avg_fill_price * filled_qty)::float8 AS notional FROM real_orders "
+        "WHERE status = 'complete' AND avg_fill_price IS NOT NULL AND filled_qty > 0 "
+        "AND updated_at > $1 AND updated_at <= $2",
+        prev["as_of"], cur["as_of"],
+    )
+    manual = await fetch(
+        "SELECT side, (avg_price * qty)::float8 AS notional FROM manual_trades "
+        "WHERE avg_price IS NOT NULL AND order_ts > $1 AND order_ts <= $2",
+        prev["as_of"], cur["as_of"],
+    )
+    trades = [(r["side"], r["notional"]) for r in orders]
+    trades += [(r["side"], r["notional"]) for r in manual]
+    residual = cash_flow_residual(prev["cash"], cur["cash"], trades)
+    kind = reconcile_kind(residual, settings.reconcile_alert_threshold)
+    if kind is None:
+        return
+    now_str = now_ist().strftime("%H:%M IST")
+    text = whatsapp.format_cash_reconcile(amount=residual, kind=kind, now_ist_str=now_str)
+    delivered = await whatsapp.broadcast(text)
+    sign = "+" if residual > 0 else "-"
+    await conn_execute(
+        """
+        INSERT INTO real_signals
+            (signal_key, portfolio_id, symbol, side, qty, price, reason, placeable, note, sent_ok, targets)
+        VALUES ($1, NULL, 'CASH', 'INFO', 0, $2, $3, FALSE, $4, $5, $6)
+        ON CONFLICT (signal_key) DO UPDATE
+          SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
+              targets = GREATEST(real_signals.targets, EXCLUDED.targets)
+        """,
+        key, round(abs(residual), 2), f"reconcile {kind}",
+        f"unexplained cash {sign}₹{abs(residual):,.0f}", delivered > 0, delivered,
+    )
+
+
 async def reconcile_open_orders(client: AngelClient, portfolio_id: int) -> None:
     """Poll Angel's order book and update any non-terminal real_orders rows."""
     open_rows = await fetch(
@@ -927,6 +989,12 @@ async def tick() -> None:
         await emit_suspension_alerts()
     except Exception:  # noqa: BLE001
         log.exception("suspension alert check failed")
+    # Cash-flow reconciliation — alert if free cash moved with no trade behind it (an unrecorded
+    # deposit/withdrawal), so it never silently becomes P&L. Always-on, alert-only; never breaks the tick.
+    try:
+        await emit_cash_reconcile_alerts()
+    except Exception:  # noqa: BLE001
+        log.exception("cash reconcile check failed")
 
     # 2. Master switch.
     if not await bot_enabled():

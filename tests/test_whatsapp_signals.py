@@ -21,8 +21,8 @@ from datetime import date, datetime, timedelta, timezone  # noqa: E402
 
 from src.core import metrics, whatsapp  # noqa: E402
 from src.engine.real_executor import (  # noqa: E402
-    _logical_key_from_trade, cumulative_split_factor, engine_symbol_root, intent_key,
-    split_adjust_position, symbol_lag_days,
+    _logical_key_from_trade, cash_flow_residual, cumulative_split_factor, engine_symbol_root,
+    intent_key, reconcile_kind, split_adjust_position, symbol_lag_days,
 )
 
 
@@ -222,6 +222,46 @@ def test_split_adjust_position_compounds_and_rounds_qty():
     acts = [(date(2023, 6, 1), 2.0), (date(2024, 10, 28), 5.0)]
     qty, avg = split_adjust_position(date(2023, 1, 1), 3, 990.0, acts)
     assert qty == 30 and avg == 99.0
+
+
+# ---------- cash-flow reconciliation: unrecorded deposit / withdrawal ----------
+
+def test_cash_flow_residual_no_trades_is_the_raw_delta():
+    assert cash_flow_residual(18_000, 28_000, []) == 10_000.0    # +10k appeared, nothing traded
+    assert cash_flow_residual(28_000, 18_000, []) == -10_000.0   # -10k left
+
+
+def test_cash_flow_residual_nets_out_trades():
+    # A sell added 5000, a buy took 2000 → free cash should have risen 3000 on its own.
+    trades = [("SELL", 5_000.0), ("BUY", 2_000.0)]
+    assert cash_flow_residual(10_000, 13_000, trades) == 0.0     # fully explained by trading
+    # Same trades, but cash rose 13000 → 10000 unexplained on top (a deposit).
+    assert cash_flow_residual(10_000, 23_000, trades) == 10_000.0
+
+
+def test_cash_flow_residual_ignores_unknown_sides_and_casts_strings():
+    trades = [("sell", "1000"), ("hold", 999), ("BUY", "400")]   # +1000 −400, 'hold' ignored
+    assert cash_flow_residual(0, 600, trades) == 0.0
+
+
+def test_reconcile_kind_thresholds():
+    assert reconcile_kind(10_000, 1_000) == "deposit"
+    assert reconcile_kind(-10_000, 1_000) == "withdrawal"
+    assert reconcile_kind(500, 1_000) is None                    # brokerage/slippage noise
+    assert reconcile_kind(-500, 1_000) is None
+    assert reconcile_kind(1_000, 1_000) == "deposit"             # boundary is inclusive
+
+
+def test_format_cash_reconcile_nudges_recording():
+    dep = whatsapp.format_cash_reconcile(amount=10_000, kind="deposit", now_ist_str="10:00 IST")
+    assert "10,000" in dep and "record" in dep.lower() and "profit" in dep.lower()
+    wd = whatsapp.format_cash_reconcile(amount=-4_000, kind="withdrawal", now_ist_str="10:00 IST")
+    assert "4,000" in wd and "record" in wd.lower()
+
+
+def test_reconcile_alert_threshold_default():
+    from src.core.config import settings
+    assert settings.reconcile_alert_threshold == 1_000.0
 
 
 # ---------- gateway is OFF by default (no accidental network sends) ----------

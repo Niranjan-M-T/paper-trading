@@ -274,9 +274,24 @@
 
 <!-- SIP Deposits -->
 <section class="card-2 mb-5 overflow-hidden">
-  <div class="px-4 py-3 border-b border-default">
-    <span class="text-sm font-semibold text-default">SIP Deposits</span>
-    <span class="text-xs text-muted ml-2">auto-detected cash increases ≥ ₹500</span>
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between gap-3 flex-wrap">
+    <div>
+      <span class="text-sm font-semibold text-default">Deposits &amp; withdrawals</span>
+      <span class="text-xs text-muted ml-2">real cash in / out — sets the cost basis for P&amp;L</span>
+    </div>
+    <div class="flex items-center gap-2 text-xs">
+      <select id="dep-kind" class="bg-surface2 border border-default rounded px-2 py-1 text-default">
+        <option value="deposit">Deposit</option>
+        <option value="withdrawal">Withdrawal</option>
+      </select>
+      <span class="text-muted">₹</span>
+      <input id="dep-amount" type="number" min="1" step="1" placeholder="amount"
+             class="w-24 bg-surface2 border border-default rounded px-2 py-1 text-default" />
+      <input id="dep-date" type="date" title="date the cash moved (optional)"
+             class="bg-surface2 border border-default rounded px-2 py-1 text-default" />
+      <button id="dep-btn" onclick="recordDeposit()"
+              class="bg-green-600 hover:bg-green-700 text-white rounded px-3 py-1 font-semibold">Record</button>
+    </div>
   </div>
   <div class="overflow-x-auto">
     <table class="w-full text-sm">
@@ -303,7 +318,7 @@
           <td class="px-4 py-2 text-xs text-muted">{{ d.note or "—" }}</td>
         </tr>
         {% else %}
-        <tr><td colspan="5" class="px-4 py-6 text-center text-muted text-xs">No SIP deposits detected yet. Transfer funds to Angel and the bot will auto-detect the deposit within one tick.</td></tr>
+        <tr><td colspan="5" class="px-4 py-6 text-center text-muted text-xs">No deposits recorded yet. When you move cash in or out of Angel, record it here so it counts as capital — not profit. The bot also WhatsApps you when it spots unrecorded cash.</td></tr>
         {% endfor %}
         {% if deposits %}
         <tr class="bg-surface2">
@@ -594,6 +609,28 @@
       alert("Toggle failed: " + e);
     } finally {
       btn.disabled = false;
+    }
+  };
+
+  // ---- record a deposit / withdrawal ----
+  window.recordDeposit = async function () {
+    const kind = document.getElementById("dep-kind").value;
+    const amount = parseFloat(document.getElementById("dep-amount").value);
+    const date = document.getElementById("dep-date").value;
+    if (!(amount > 0)) { alert("Enter an amount greater than 0"); return; }
+    const btn = document.getElementById("dep-btn");
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      const r = await fetch("/api/bot/deposit", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({kind, amount, date: date || undefined}),
+      });
+      if (!r.ok) { alert("Error: " + (await r.text())); return; }
+      location.reload();
+    } catch (e) {
+      alert("Failed: " + e);
+    } finally {
+      btn.disabled = false; btn.textContent = "Record";
     }
   };
 

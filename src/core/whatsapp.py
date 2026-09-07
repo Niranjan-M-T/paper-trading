@@ -162,3 +162,21 @@ def format_suspension_alert(symbol: str, *, days_lag: int, qty: int, now_ist_str
             f"That usually means a suspension, delisting, or a merger/M&A in progress. The bot "
             f"can't manage or exit a scrip that isn't trading — check the corporate action and "
             f"handle it manually.  ·  {now_ist_str}")
+
+
+def format_cash_reconcile(*, amount: float, kind: str, now_ist_str: str) -> str:
+    """Build the WhatsApp text for an unexplained change in the account's FREE CASH — cash that
+    moved with no bot or manual trade behind it, i.e. almost certainly a deposit or withdrawal
+    that hasn't been recorded yet.
+
+    Until it's recorded in real_deposits the cost basis is wrong: a deposit shows up as phantom
+    profit, a withdrawal as a phantom loss. So this is a 'go record it' nudge, never an automated
+    booking — the same alert-first stance as the corporate-action guard."""
+    amt = abs(float(amount))
+    if kind == "withdrawal":
+        return (f"💸 ₹{amt:,.0f} left your account cash with no matching trade.\n"
+                f"If you withdrew it, record it on the /bot page so your return isn't understated."
+                f"  ·  {now_ist_str}")
+    return (f"💰 ₹{amt:,.0f} appeared in your account cash with no matching bot or manual trade.\n"
+            f"If you deposited it, record it on the /bot page so it counts as capital — otherwise "
+            f"it shows up as profit.  ·  {now_ist_str}")

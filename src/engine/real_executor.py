@@ -112,6 +112,44 @@ def split_adjust_position(first_seen: date, qty: int, avg_price: float, actions)
     return int(round(qty * f)), float(avg_price) / f
 
 
+def cash_flow_residual(prev_cash: float, now_cash: float, filled_trades) -> float:
+    """Signed cash that a change in broker FREE CASH does NOT explain by trades — the core of
+    deposit/withdrawal detection. Pure.
+
+    `filled_trades` is an iterable of (side, notional) with notional = fill_price × qty ≥ 0 for
+    every fill (bot or manual) that settled in the same window as the cash change. A SELL adds
+    cash (+notional), a BUY removes it (−notional); any other side is ignored. The residual is
+    the free-cash change minus what trading moved:
+
+        residual = (now_cash − prev_cash) − Σ(+sell, −buy)
+
+    A market rally never touches free cash, so it drops out entirely — that is exactly what broke
+    the old net-value detector. A large positive residual ⇒ cash appeared with no trade behind it
+    (a deposit); a large negative residual ⇒ cash left with no trade (a withdrawal). Brokerage /
+    slippage leave a small residual, which the caller's threshold absorbs."""
+    delta = float(now_cash) - float(prev_cash)
+    explained = 0.0
+    for side, notional in filled_trades:
+        s = str(side).upper()
+        n = float(notional)
+        if s == "SELL":
+            explained += n
+        elif s == "BUY":
+            explained -= n
+    return delta - explained
+
+
+def reconcile_kind(residual: float, threshold: float) -> str | None:
+    """Classify a cash-flow residual: 'deposit' (≥ +threshold), 'withdrawal' (≤ −threshold), else
+    None (explained by trades, or within brokerage/slippage/dividend noise). Pure."""
+    t = abs(float(threshold))
+    if residual >= t:
+        return "deposit"
+    if residual <= -t:
+        return "withdrawal"
+    return None
+
+
 def surveillance_reject_code(error_text: str | None) -> str | None:
     """Return the broker rejection code IF an order error is a surveillance/cautionary block
     we should quarantine on (e.g. ``AB4036``), else ``None``.

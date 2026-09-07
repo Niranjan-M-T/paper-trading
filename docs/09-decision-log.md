@@ -194,6 +194,36 @@ change: the stateless replay already rebuilds their basis from the back-adjusted
 
 **Still pending:** auto-scheduling `--detect` (weekly); Track B (port Round 62 events + `news_data`).
 
+## 2026-09-08 — Cash-flow reconciliation (unrecorded deposit/withdrawal guard)
+
+Owner deposited ₹10,000 and it showed up as **phantom P&L** instead of capital. Root cause is
+by design: since the net-value SIP auto-detector was disabled (it booked market rallies as
+phantom deposits), `invested` only rises when a `real_deposits` row is hand-entered — so a real
+cash top-up raises broker free cash and `net_worth` but not `invested`, and the gap becomes P&L.
+Nothing watched that gap. Two-part fix, both **detect + alert, never auto-book** (the same
+alert-first stance as the corporate-action guard):
+
+**(1) Reconciliation alert.** Pure `real_executor.cash_flow_residual(prev_cash, now_cash,
+filled_trades)` = Δfree-cash − Σ(+sell, −buy). The key robustness upgrade over the old detector:
+it watches **free cash netted against trades**, not net account value — a market rally never
+touches free cash, so it drops out entirely (the confound that made a holdings rally look like a
+deposit). `reconcile_kind(residual, threshold)` → 'deposit'/'withdrawal'/None.
+`real_trader.emit_cash_reconcile_alerts()` runs always-on in `tick()` (after
+`emit_suspension_alerts`): it compares the two most recent **settled** `real_funds` snapshots
+(`as_of <= now() − 3min`, so the manual-trade tagger has caught up → no false "withdrawal?" the
+instant a manual buy debits cash before its row is tagged), nets `real_orders`
+(`avg_fill_price×filled_qty`) + `manual_trades` (`avg_price×qty`) in the window, and WhatsApps
+`format_cash_reconcile` when |residual| ≥ `RECONCILE_ALERT_THRESHOLD` (default ₹1,000, above
+brokerage/slippage/dividend noise). Deduped on `real_signals` key `reconcile:<snapshot id>` →
+exactly one alert per jump (the delta is a one-tick spike; later snapshots are delta≈0). Doesn't
+retroactively alert an already-past jump.
+
+**(2) Record UI.** POST `/api/bot/deposit` (`require_admin`) writes `real_deposits`; a withdrawal
+is a **negative amount** (`invested = opening + Σ amount`), optional back-date. The `/bot` deposits
+card got an inline Deposit/Withdrawal + amount + date + Record form (vanilla `fetch`), replacing
+the stale "SIP auto-detected ≥ ₹500" copy. This closes the friction (hand-written SQL) that let
+the deposit go unrecorded in the first place. Tests: 35/35. No new SQL; threshold defaults in code.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

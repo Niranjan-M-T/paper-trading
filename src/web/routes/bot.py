@@ -559,3 +559,44 @@ async def api_bot_toggle(request: Request) -> JSONResponse:
         new_state,
     )
     return JSONResponse({"enabled": new_state, "now_ist": now_ist().strftime("%Y-%m-%d %H:%M:%S IST")})
+
+
+# ---------- record a deposit / withdrawal ----------
+
+@router.post("/api/bot/deposit")
+async def api_bot_deposit(request: Request) -> JSONResponse:
+    """Admin: record a real cash top-up (or withdrawal) into real_deposits, so the cost basis
+    (`invested`) tracks money actually put in — instead of a deposit showing up as phantom P&L.
+    A withdrawal is stored as a NEGATIVE amount (invested = opening + Σ amount)."""
+    require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "expected a JSON object"}, status_code=400)
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "amount must be a number"}, status_code=400)
+    if not amount > 0:
+        return JSONResponse({"error": "amount must be greater than 0"}, status_code=400)
+    kind = str(body.get("kind") or "deposit").strip().lower()
+    if kind not in ("deposit", "withdrawal"):
+        return JSONResponse({"error": "kind must be 'deposit' or 'withdrawal'"}, status_code=400)
+    signed = amount if kind == "deposit" else -amount
+    note = str(body.get("note") or "").strip() or f"manual {kind} recorded via /bot"
+    date_str = str(body.get("date") or "").strip()
+    ts = None
+    if date_str:
+        try:
+            ts = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=12, tzinfo=IST)
+        except ValueError:
+            return JSONResponse({"error": "date must be YYYY-MM-DD"}, status_code=400)
+    if ts is not None:
+        await execute("INSERT INTO real_deposits (ts, amount, note) VALUES ($1, $2, $3)",
+                      ts, signed, note)
+    else:
+        await execute("INSERT INTO real_deposits (amount, note) VALUES ($1, $2)", signed, note)
+    return JSONResponse({"ok": True, "kind": kind, "amount": signed,
+                         "now_ist": now_ist().strftime("%Y-%m-%d %H:%M:%S IST")})
