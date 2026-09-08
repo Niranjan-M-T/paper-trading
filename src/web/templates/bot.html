@@ -272,6 +272,30 @@
 </section>
 {% endif %}
 
+<!-- Cash confirmation queue (one-tap) -->
+{% if pending_reconcile %}
+<section class="card-2 mb-5 overflow-hidden" style="border:1px solid rgba(245,158,11,0.45)">
+  <div class="px-4 py-3 border-b border-default">
+    <span class="text-sm font-semibold text-default">⚠️ Unexplained cash — confirm in one tap</span>
+    <span class="text-xs text-muted ml-2">cash moved with no trade behind it; tell the bot what it was so your P&amp;L stays honest</span>
+  </div>
+  <div class="divide-y divide-default">
+    {% for p in pending_reconcile %}
+    <div class="px-4 py-3 flex items-center justify-between gap-3 flex-wrap" id="recon-{{ p.id }}">
+      <div class="text-sm text-default">
+        {% if p.amount >= 0 %}💰 <strong>₹{{ "{:,.0f}".format(p.amount) }}</strong> came in{% else %}💸 <strong>₹{{ "{:,.0f}".format(-p.amount) }}</strong> went out{% endif %}
+        <span class="text-xs text-muted ml-1">{{ p.detected_at | ist }}</span>
+      </div>
+      <div class="flex items-center gap-2 text-xs">
+        <button onclick="resolveReconcile({{ p.id }}, 'confirm')" class="bg-green-600 hover:bg-green-700 text-white rounded px-3 py-1 font-semibold">{% if p.amount >= 0 %}✓ It's a deposit{% else %}✓ It's a withdrawal{% endif %}</button>
+        <button onclick="resolveReconcile({{ p.id }}, 'dismiss')" class="bg-surface2 hover:bg-surface border border-default text-default rounded px-3 py-1">✕ Not capital</button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <!-- SIP Deposits -->
 <section class="card-2 mb-5 overflow-hidden">
   <div class="px-4 py-3 border-b border-default flex items-center justify-between gap-3 flex-wrap">
@@ -631,6 +655,23 @@
       alert("Failed: " + e);
     } finally {
       btn.disabled = false; btn.textContent = "Record";
+    }
+  };
+
+  // ---- cash reconciliation: one-tap confirm ----
+  window.resolveReconcile = async function (id, action) {
+    const row = document.getElementById("recon-" + id);
+    if (row) row.style.opacity = "0.5";
+    try {
+      const r = await fetch(`/api/bot/reconcile/${id}/resolve`, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({action}),
+      });
+      if (!r.ok) { alert("Error: " + (await r.text())); if (row) row.style.opacity = "1"; return; }
+      location.reload();
+    } catch (e) {
+      alert("Failed: " + e);
+      if (row) row.style.opacity = "1";
     }
   };
 

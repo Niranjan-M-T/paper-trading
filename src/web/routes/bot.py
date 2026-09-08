@@ -88,6 +88,10 @@ async def bot_page(request: Request) -> HTMLResponse:
         "FROM real_deposits ORDER BY ts DESC"
     )
     total_deposited = sum(float(r["amount"]) for r in deposits)
+    pending_reconcile = await fetch(
+        "SELECT id, detected_at, amount::float8 AS amount, direction "
+        "FROM cash_reconcile WHERE status = 'pending' ORDER BY detected_at DESC"
+    )
 
     return request.app.state.templates.TemplateResponse(
         request, "bot.html",
@@ -99,6 +103,7 @@ async def bot_page(request: Request) -> HTMLResponse:
             "funds": funds_ctx,
             "deposits": [dict(r) for r in deposits],
             "total_deposited": total_deposited,
+            "pending_reconcile": [dict(r) for r in pending_reconcile],
             "market_open": is_market_open(),
         },
     )
@@ -600,3 +605,69 @@ async def api_bot_deposit(request: Request) -> JSONResponse:
         await execute("INSERT INTO real_deposits (amount, note) VALUES ($1, $2)", signed, note)
     return JSONResponse({"ok": True, "kind": kind, "amount": signed,
                          "now_ist": now_ist().strftime("%Y-%m-%d %H:%M:%S IST")})
+
+
+# ---------- cash reconciliation: one-tap confirm queue ----------
+
+@router.get("/api/bot/reconcile/pending")
+async def api_reconcile_pending(request: Request) -> JSONResponse:
+    """Pending cash-flow reconciliations awaiting the owner's one-tap confirm (for the /bot card
+    and its poller)."""
+    rows = await fetch(
+        "SELECT id, detected_at, amount::float8 AS amount, direction "
+        "FROM cash_reconcile WHERE status = 'pending' ORDER BY detected_at DESC"
+    )
+    return JSONResponse([
+        {"id": r["id"],
+         "detected_at": r["detected_at"].isoformat() if r["detected_at"] else None,
+         "amount": float(r["amount"]), "direction": r["direction"]}
+        for r in rows
+    ])
+
+
+@router.post("/api/bot/reconcile/{item_id}/resolve")
+async def api_reconcile_resolve(item_id: int, request: Request) -> JSONResponse:
+    """Admin: resolve a queued cash move. action='confirm' books a real_deposits row (signed:
+    + deposit, − withdrawal, taken from the detected residual); action='dismiss' marks it a
+    dividend / non-capital credit and changes nothing. Idempotent — a double tap can't
+    double-book, because the pending→confirmed flip is the guard for the deposit write."""
+    require_admin(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    action = str((body or {}).get("action") or "").strip().lower()
+    if action not in ("confirm", "dismiss"):
+        return JSONResponse({"error": "action must be 'confirm' or 'dismiss'"}, status_code=400)
+    row = await fetchrow(
+        "SELECT amount::float8 AS amount, direction, status FROM cash_reconcile WHERE id = $1",
+        item_id,
+    )
+    if row is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if row["status"] != "pending":
+        return JSONResponse({"ok": True, "already": row["status"]})  # resolved by someone already
+    if action == "dismiss":
+        await execute(
+            "UPDATE cash_reconcile SET status = 'dismissed', resolved_at = now(), "
+            "resolved_kind = 'other' WHERE id = $1 AND status = 'pending'",
+            item_id,
+        )
+        return JSONResponse({"ok": True, "status": "dismissed"})
+    # confirm → flip pending→confirmed atomically, then book exactly once
+    kind = row["direction"]
+    flipped = await fetchrow(
+        "UPDATE cash_reconcile SET status = 'confirmed', resolved_at = now(), resolved_kind = $2 "
+        "WHERE id = $1 AND status = 'pending' RETURNING id",
+        item_id, kind,
+    )
+    if flipped is None:
+        return JSONResponse({"ok": True, "already": True})  # lost a double-tap race; not re-booked
+    amount = float(row["amount"])  # signed: + deposit, − withdrawal
+    dep = await fetchrow(
+        "INSERT INTO real_deposits (amount, note) VALUES ($1, $2) RETURNING id",
+        amount, f"confirmed {kind} via reconcile #{item_id}",
+    )
+    if dep is not None:
+        await execute("UPDATE cash_reconcile SET deposit_id = $2 WHERE id = $1", item_id, dep["id"])
+    return JSONResponse({"ok": True, "status": "confirmed", "kind": kind, "amount": amount})

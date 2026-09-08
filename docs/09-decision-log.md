@@ -224,6 +224,22 @@ card got an inline Deposit/Withdrawal + amount + date + Record form (vanilla `fe
 the stale "SIP auto-detected ≥ ₹500" copy. This closes the friction (hand-written SQL) that let
 the deposit go unrecorded in the first place. Tests: 35/35. No new SQL; threshold defaults in code.
 
+**(3) One-tap confirmation queue (same day).** Owner asked "why can't the bot do it automatically?"
+Checked the Angel SmartAPI: its funds endpoint (`getRMS`) returns an aggregate balance, and there
+is **no ledger / transactions endpoint** anywhere in SmartAPI — the labelled ledger (deposit vs
+dividend vs charge) exists only in the web/app, not the API. So the bot can see *that* cash moved,
+never *what kind* — full auto-booking is impossible without guessing deposit-vs-dividend, the exact
+thing that corrupted the numbers before. Built the middle ground instead: detection now queues a
+**pending confirmation** (`sql/015 cash_reconcile`, dedup `UNIQUE(snapshot_id)`, replacing the old
+`real_signals` reconcile dedup) carrying the signed residual + direction; `/bot` shows an amber card
+with one-tap **✓ deposit/withdrawal** / **✕ not capital** buttons (`require_admin`), and the WhatsApp
+alert deep-links there (`DASHBOARD_URL`, optional). Confirm books a `real_deposits` row via
+`POST /api/bot/reconcile/{id}/resolve`; the pending→confirmed flip is atomic so a double-tap can't
+double-book; dismiss records a dividend/other with no cost-basis change. Deliberately NOT a WhatsApp
+inbound-webhook / native-button flow: that would be a public endpoint booking real money, so the
+tap stays behind the dashboard's admin login. Tests: 35/35. Deploy: run `sql/015` **before** the
+`pm2 restart` (the /bot page reads the table).
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

@@ -885,10 +885,6 @@ async def emit_cash_reconcile_alerts() -> None:
     if len(rows) < 2:
         return
     cur, prev = rows[0], rows[1]
-    key = f"reconcile:{cur['id']}"
-    prev_sig = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
-    if prev_sig and prev_sig["sent_ok"]:
-        return  # already alerted for this snapshot
     # Everything that moved cash in the window (bot fills + tagged manual trades), by real value.
     orders = await fetch(
         "SELECT side, (avg_fill_price * filled_qty)::float8 AS notional FROM real_orders "
@@ -907,22 +903,20 @@ async def emit_cash_reconcile_alerts() -> None:
     kind = reconcile_kind(residual, settings.reconcile_alert_threshold)
     if kind is None:
         return
-    now_str = now_ist().strftime("%H:%M IST")
-    text = whatsapp.format_cash_reconcile(amount=residual, kind=kind, now_ist_str=now_str)
-    delivered = await whatsapp.broadcast(text)
-    sign = "+" if residual > 0 else "-"
-    await conn_execute(
-        """
-        INSERT INTO real_signals
-            (signal_key, portfolio_id, symbol, side, qty, price, reason, placeable, note, sent_ok, targets)
-        VALUES ($1, NULL, 'CASH', 'INFO', 0, $2, $3, FALSE, $4, $5, $6)
-        ON CONFLICT (signal_key) DO UPDATE
-          SET sent_ok = real_signals.sent_ok OR EXCLUDED.sent_ok,
-              targets = GREATEST(real_signals.targets, EXCLUDED.targets)
-        """,
-        key, round(abs(residual), 2), f"reconcile {kind}",
-        f"unexplained cash {sign}₹{abs(residual):,.0f}", delivered > 0, delivered,
+    # Queue a one-tap confirmation for the owner, deduped on the detecting snapshot. If a row
+    # already exists for this snapshot (pending or already resolved), don't re-queue or re-alert.
+    new = await fetchrow(
+        "INSERT INTO cash_reconcile (snapshot_id, amount, direction, window_start, window_end) "
+        "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (snapshot_id) DO NOTHING RETURNING id",
+        cur["id"], round(residual, 2), kind, prev["as_of"], cur["as_of"],
     )
+    if new is None:
+        return
+    now_str = now_ist().strftime("%H:%M IST")
+    confirm_url = f"{settings.dashboard_url.rstrip('/')}/bot" if settings.dashboard_url else ""
+    text = whatsapp.format_cash_reconcile(
+        amount=residual, kind=kind, now_ist_str=now_str, confirm_url=confirm_url)
+    await whatsapp.broadcast(text)
 
 
 async def reconcile_open_orders(client: AngelClient, portfolio_id: int) -> None:

@@ -88,9 +88,14 @@ class Settings:
 
     # Cash-flow reconciliation: WhatsApp-alert when the account's free cash changes by at least
     # this many rupees with no bot or manual trade to explain it — an unrecorded deposit (which
-    # otherwise shows up as phantom profit) or withdrawal. Detect-only; the user records it via
-    # /bot. Set high enough to clear brokerage/slippage/dividend noise. ₹1,000 default.
+    # otherwise shows up as phantom profit) or withdrawal. Detect-only; the user confirms it in
+    # one tap on /bot. Set high enough to clear brokerage/slippage/dividend noise. ₹1,000 default.
     reconcile_alert_threshold: float
+
+    # Public base URL of the dashboard (e.g. https://bot.example.com), used to deep-link the
+    # WhatsApp reconciliation alert straight to the /bot confirm queue. Empty → the alert just
+    # says "open your /bot dashboard" with no link.
+    dashboard_url: str
 
     # Market-data source for the live poller: 'angel' (default, per-symbol Angel
     # calls) or 'yfinance' (one batched Yahoo download for the whole universe —
@@ -194,6 +199,7 @@ def load_settings() -> Settings:
         deposit_autodetect=_opt("DEPOSIT_AUTODETECT", "false").strip().lower() in ("1", "true", "yes", "on"),
         suspend_stale_days=int(_opt("SUSPEND_STALE_DAYS", "3")),
         reconcile_alert_threshold=float(_opt("RECONCILE_ALERT_THRESHOLD", "1000")),
+        dashboard_url=_opt("DASHBOARD_URL", "").strip(),
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
         yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),

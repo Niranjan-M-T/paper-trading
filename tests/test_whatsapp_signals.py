@@ -252,11 +252,15 @@ def test_reconcile_kind_thresholds():
     assert reconcile_kind(1_000, 1_000) == "deposit"             # boundary is inclusive
 
 
-def test_format_cash_reconcile_nudges_recording():
+def test_format_cash_reconcile_nudges_confirmation():
     dep = whatsapp.format_cash_reconcile(amount=10_000, kind="deposit", now_ist_str="10:00 IST")
-    assert "10,000" in dep and "record" in dep.lower() and "profit" in dep.lower()
+    assert "10,000" in dep and "confirm" in dep.lower() and "profit" in dep.lower()
     wd = whatsapp.format_cash_reconcile(amount=-4_000, kind="withdrawal", now_ist_str="10:00 IST")
-    assert "4,000" in wd and "record" in wd.lower()
+    assert "4,000" in wd and "confirm" in wd.lower()
+    # a deep link is embedded only when a dashboard URL is supplied
+    linked = whatsapp.format_cash_reconcile(amount=5_000, kind="deposit", now_ist_str="10:00 IST",
+                                            confirm_url="https://x.test/bot")
+    assert "https://x.test/bot" in linked
 
 
 def test_reconcile_alert_threshold_default():

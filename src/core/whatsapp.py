@@ -164,19 +164,19 @@ def format_suspension_alert(symbol: str, *, days_lag: int, qty: int, now_ist_str
             f"handle it manually.  ·  {now_ist_str}")
 
 
-def format_cash_reconcile(*, amount: float, kind: str, now_ist_str: str) -> str:
+def format_cash_reconcile(*, amount: float, kind: str, now_ist_str: str, confirm_url: str = "") -> str:
     """Build the WhatsApp text for an unexplained change in the account's FREE CASH — cash that
     moved with no bot or manual trade behind it, i.e. almost certainly a deposit or withdrawal
     that hasn't been recorded yet.
 
-    Until it's recorded in real_deposits the cost basis is wrong: a deposit shows up as phantom
-    profit, a withdrawal as a phantom loss. So this is a 'go record it' nudge, never an automated
-    booking — the same alert-first stance as the corporate-action guard."""
+    The bot has queued a one-tap confirmation on the dashboard; this nudges the owner to resolve
+    it. Nothing is auto-booked — only the human can tell a deposit from a dividend (Angel exposes
+    one blended cash figure, not a labelled ledger). `confirm_url`, when set, deep-links to /bot."""
     amt = abs(float(amount))
+    where = f"Confirm it in one tap: {confirm_url}" if confirm_url else \
+        "Confirm it in one tap on your /bot dashboard"
     if kind == "withdrawal":
         return (f"💸 ₹{amt:,.0f} left your account cash with no matching trade.\n"
-                f"If you withdrew it, record it on the /bot page so your return isn't understated."
-                f"  ·  {now_ist_str}")
+                f"{where} — so your return stays accurate.  ·  {now_ist_str}")
     return (f"💰 ₹{amt:,.0f} appeared in your account cash with no matching bot or manual trade.\n"
-            f"If you deposited it, record it on the /bot page so it counts as capital — otherwise "
-            f"it shows up as profit.  ·  {now_ist_str}")
+            f"{where} — otherwise it counts as profit instead of capital.  ·  {now_ist_str}")
