@@ -97,6 +97,15 @@ class Settings:
     # says "open your /bot dashboard" with no link.
     dashboard_url: str
 
+    # Shadow buy-points: each tick, run a SECOND non-persisting engine replay with unlimited
+    # simulated cash so the strategy emits every entry it WANTS even when the real account is
+    # cash-gated. Logged to shadow_buy_points and surfaced on /bot so you can see, when a SIP
+    # lands, which entries were missed and whether they're still catchable. Default on.
+    shadow_buy_points: bool
+    # Only log/show shadow buy-points from the last N calendar days — old wants aren't
+    # actionable (their prices have long since moved). Default 45.
+    shadow_lookback_days: int
+
     # Market-data source for the live poller: 'angel' (default, per-symbol Angel
     # calls) or 'yfinance' (one batched Yahoo download for the whole universe —
     # removes the Angel historical-API rate-limit storm). Validated 2026-07-01 to
@@ -197,9 +206,11 @@ def load_settings() -> Settings:
         real_trader_intent_max_age_days=int(_opt("REAL_TRADER_INTENT_MAX_AGE_DAYS", "1")),
         real_opening_capital=float(_opt("REAL_OPENING_CAPITAL", "18000")),
         deposit_autodetect=_opt("DEPOSIT_AUTODETECT", "false").strip().lower() in ("1", "true", "yes", "on"),
-        suspend_stale_days=int(_opt("SUSPEND_STALE_DAYS", "3")),
+        suspend_stale_days=int(_opt("SUSPEND_STALE_DAYS", "5")),
         reconcile_alert_threshold=float(_opt("RECONCILE_ALERT_THRESHOLD", "1000")),
         dashboard_url=_opt("DASHBOARD_URL", "").strip(),
+        shadow_buy_points=_opt("SHADOW_BUY_POINTS", "true").strip().lower() in ("1", "true", "yes", "on"),
+        shadow_lookback_days=int(_opt("SHADOW_LOOKBACK_DAYS", "45")),
         data_source=_opt("DATA_SOURCE", "angel").strip().lower(),
         yf_failover_min_coverage=float(_opt("YF_FAILOVER_MIN_COVERAGE", "0.5")),
         yf_topup_max_symbols=int(_opt("YF_TOPUP_MAX_SYMBOLS", "20")),

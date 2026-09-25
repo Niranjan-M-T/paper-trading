@@ -356,6 +356,50 @@
   </div>
 </section>
 
+<!-- Shadow buy-points: what the strategy wanted while cash-gated -->
+<section class="card-2 mb-5 overflow-hidden">
+  <div class="px-4 py-3 border-b border-default">
+    <span class="text-sm font-semibold text-default">🔭 Shadow buy-points — what the strategy wanted</span>
+    <span class="text-xs text-muted ml-2">entries the strategy would have taken if it had money, even while the account was cash-gated — so when a SIP lands you can see which are still catchable at that price or lower</span>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-default text-xs text-muted">
+          <th class="px-4 py-2 text-left">Symbol</th>
+          <th class="px-4 py-2 text-left">Wanted on</th>
+          <th class="px-4 py-2 text-right">Wanted @</th>
+          <th class="px-4 py-2 text-right">Now</th>
+          <th class="px-4 py-2 text-right">Low since</th>
+          <th class="px-4 py-2 text-left">Still catchable?</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in shadow_points %}
+        <tr class="border-b border-default hover:bg-surface2 transition-colors">
+          <td class="px-4 py-2 font-semibold text-default">{{ s.symbol }}</td>
+          <td class="px-4 py-2 text-xs text-muted">{{ s.signal_date }}{% if s.signal_time %} · {{ s.signal_time }}{% endif %}</td>
+          <td class="px-4 py-2 text-right font-mono">₹{{ "{:,.2f}".format(s.price) }}</td>
+          <td class="px-4 py-2 text-right font-mono">{% if s.last_price is not none %}₹{{ "{:,.2f}".format(s.last_price) }}{% else %}<span class="text-muted">—</span>{% endif %}</td>
+          <td class="px-4 py-2 text-right font-mono text-muted text-xs">{% if s.low_since is not none %}₹{{ "{:,.2f}".format(s.low_since) }}{% else %}—{% endif %}</td>
+          <td class="px-4 py-2 text-xs">
+            {% if s.last_price is none %}
+              <span class="text-muted">no price data</span>
+            {% elif s.buyable %}
+              <span style="color:#22c55e" class="font-semibold">✅ ≤ your price{% if s.pct is not none %} ({{ "{:+.1f}".format(s.pct) }}%){% endif %}</span>
+            {% else %}
+              <span style="color:#f59e0b">▲ ran up{% if s.pct is not none %} {{ "{:+.1f}".format(s.pct) }}%{% endif %}</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="px-4 py-6 text-center text-muted text-xs">No shadow buy-points yet. While the bot is ON, the strategy runs each tick as if cash were unlimited and logs every entry it would take here — so a dry spell with no money still shows you what it wanted, and whether the price has since moved.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
 {% if not is_viewer %}
 <!-- Runner logs (admin only) -->
 <section class="card-2 mb-5 overflow-hidden">

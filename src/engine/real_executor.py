@@ -367,6 +367,78 @@ def reconcile_sell_qty(
     return max(0, min(int(engine_qty), available))
 
 
+# ---------- shadow buy-points (what the strategy wants while the account is cash-gated) ----------
+
+# A per-day cash figure so large the engine's cash gates can never bind (min_entry_cash at
+# v2_engine ~1494 and the per-position `cash < turnover + fee` at ~1574). Used only for the
+# SHADOW replay that captures every entry the strategy WOULD make with money, even when the real
+# account has none. Absurd on purpose (₹1 trillion) — the strategy takes every signal it generates.
+SHADOW_DAY_CASH = 1e12
+
+# The shadow replay also forces FIXED-rupee position sizing at this amount. Under the strategy's
+# native pct_equity sizing, huge cash inflates equity → inflates every position → a heavy day can
+# still exhaust the daily cash and drop some wanted entries. A fixed ₹10L per position is decoupled
+# from equity: qty is ≥1 for any NSE price and ₹1T/day funds ~1e6 of them, so no entry is ever
+# gated. Candidate SELECTION is upstream of sizing, so this changes only funding, not which names
+# the strategy wants. (Pairs with build_shadow_cash; see real_trader.emit_shadow_buy_points.)
+SHADOW_ALLOC = 1_000_000.0
+
+
+def build_shadow_cash(day_strings, per_day: float = SHADOW_DAY_CASH) -> dict[str, float]:
+    """cash_override that removes every cash gate for a shadow replay.
+
+    Maps each trading-day string ('YYYY-MM-DD') to `per_day`, so the engine marks its simulated
+    cash to an unreachable figure at the start of every day and never skips or shrinks an entry
+    for lack of funds. Deduped + sorted for a stable dict. Empty input → {} (engine no-op)."""
+    return {str(d): float(per_day) for d in sorted(set(day_strings))}
+
+
+def shadow_signal_key(sig_date, symbol: str, reason: str) -> str:
+    """Dedup key for one shadow buy-point = date · symbol · reason (NO price/qty/time).
+
+    Same shape as the real logical intent key: the engine re-emits the same entry every tick and
+    its price wiggles while the scan bar forms, so a price-free key logs each wanted entry once."""
+    return "|".join([str(sig_date), str(symbol), str(reason)])
+
+
+def extract_shadow_buys(trades, today_str: str, lookback_days: int = 45) -> list[dict]:
+    """Pull recent BUY entries from a shadow replay's trade list.
+
+    Returns [{date, time, symbol, price, reason}] for every BUY whose date is within
+    [today - lookback_days, today]. Old wants aren't actionable (their prices have long since
+    moved), so the lookback keeps the log to entries you could still act on when cash lands.
+    Order preserved (chronological, as the engine emitted them)."""
+    today = date.fromisoformat(today_str)
+    min_date = today - timedelta(days=max(0, lookback_days))
+    out: list[dict] = []
+    for t in trades:
+        if str(t.get("side")).upper() != "BUY":
+            continue
+        try:
+            d = date.fromisoformat(str(t.get("date")))
+        except (TypeError, ValueError):
+            continue
+        if d < min_date or d > today:
+            continue
+        out.append({
+            "date": str(t["date"]),
+            "time": t.get("time"),
+            "symbol": str(t["symbol"]),
+            "price": float(t["price"]),
+            "reason": str(t.get("reason", "")),
+        })
+    return out
+
+
+def shadow_buyable(target_price: float, price_now: float | None) -> bool:
+    """True if the stock is available at or below the shadow buy-point price — i.e. when a SIP
+    lands you could still enter at that price or better. `price_now` is the current (or any
+    reference) price; None (no candle data) → not confirmed buyable (fail closed)."""
+    if price_now is None:
+        return False
+    return float(price_now) <= float(target_price)
+
+
 def sip_deposit_amount(
     account_net: float | None,
     expected_baseline: float,

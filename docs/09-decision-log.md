@@ -240,6 +240,42 @@ inbound-webhook / native-button flow: that would be a public endpoint booking re
 tap stays behind the dashboard's admin login. Tests: 35/35. Deploy: run `sql/015` **before** the
 `pm2 restart` (the /bot page reads the table).
 
+## 2026-09-25 — false-alarm fixes + shadow buy-points
+
+Owner reported three false alarms from a stretch with no cash (during which they bought SUZLON by
+hand), plus asked for a system that shows what the strategy WANTS to buy even when the account is
+empty.
+
+**Fix — suspension alert spam.** A by-hand SUZLON buy is outside the bot's universe, so it has zero
+candles; `symbol_lag_days` returns its "never priced" sentinel (`10**6`) and the alert printed
+"hasn't priced in ~1000000 day(s)" — every day, because the dedup key reset daily. Root cause: the
+suspension guard is for universe names that *stop* pricing, not for holdings that were never tracked.
+Fixes in `emit_suspension_alerts`: (a) **skip when `symbol_latest is None`** — an untracked holding
+is not a suspension; (b) dedup per **ISO week** (`suspend:<sym>:<%G-W%V>`), not per day, so a
+persistent lag alerts once a week, not every morning; (c) bumped `SUSPEND_STALE_DAYS` default **3→5**
+to clear transient multi-day per-symbol data gaps (AUROPHARMA/HCC/etc.).
+
+**Fix — reconcile false withdrawal/deposit on a manual buy.** The SUZLON buy debited cash; the
+reconciliation saw the drop *before* the manual-trade tagger caught the fill → false "₹6,645
+withdrawal", then when the fill tagged in a later window it double-counted → false "₹6,637 deposit".
+Fix in `emit_cash_reconcile_alerts`: a **guard band** (`RECONCILE_GUARD`, ±30 min) — if any bot fill
+or manual trade sits near the cash-move window, treat the move as trade-related and stay silent. Real
+deposits land on quiet days; the /bot record form is the backstop for a deposit made mid-trade.
+
+**Feature — shadow buy-points.** Each tick, after the real replay, a **second, non-persisting**
+replay runs the live portfolio with unlimited cash so the strategy emits every entry it *wants*, even
+cash-gated. New recent BUYs are logged to `shadow_buy_points` (`sql/016`), and `/bot` joins them
+against live candles to show, per name: wanted @ ₹P, price now, and whether it's still catchable at
+≤ P. Key mechanics: `replay_one_portfolio(..., persist=False)` (new flag — the fantasy trade list
+must never overwrite the live portfolio's trades/positions/equity); `cash_override` set huge for
+every trading day; and, crucially, the shadow strategy is forced to **fixed-rupee sizing**
+(`allocation_mode="fixed"`, `SHADOW_ALLOC=₹10L`) because under native `pct_equity` the huge cash
+inflates equity → inflates position size → a heavy day could still exhaust cash and drop entries.
+Candidate selection is upstream of sizing, so fixed sizing changes only funding, not which names fire.
+Purely informational — never places an order; throttled to once per 5 min; fully guarded so a shadow
+bug can't break real trading; default on (`SHADOW_BUY_POINTS`), lookback `SHADOW_LOOKBACK_DAYS=45`.
+Tests: 41/41. Deploy: run `sql/016` **before** the `pm2 restart` (the /bot page reads the table).
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

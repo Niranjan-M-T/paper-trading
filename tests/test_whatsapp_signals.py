@@ -23,6 +23,8 @@ from src.core import metrics, whatsapp  # noqa: E402
 from src.engine.real_executor import (  # noqa: E402
     _logical_key_from_trade, cash_flow_residual, cumulative_split_factor, engine_symbol_root,
     intent_key, reconcile_kind, split_adjust_position, symbol_lag_days,
+    build_shadow_cash, extract_shadow_buys, shadow_signal_key, shadow_buyable,
+    SHADOW_DAY_CASH,
 )
 
 
@@ -303,3 +305,55 @@ def test_engine_symbol_root_leaves_plain_and_unknown_untouched():
     assert engine_symbol_root("SOME-XYZ") == "SOME-XYZ"   # not a known series suffix
     assert engine_symbol_root("") == ""
     assert engine_symbol_root(None) == ""
+
+
+# ---------- shadow buy-points: what the strategy wants while cash-gated ----------
+
+def test_build_shadow_cash_maps_every_day_to_unreachable_cash():
+    days = ["2026-09-20", "2026-09-21", "2026-09-20"]     # duplicate collapses
+    cash = build_shadow_cash(days)
+    assert cash == {"2026-09-20": SHADOW_DAY_CASH, "2026-09-21": SHADOW_DAY_CASH}
+    assert all(v >= 1e11 for v in cash.values())          # big enough to defeat any cash gate
+    assert build_shadow_cash([]) == {}                     # empty → engine no-op
+
+
+def test_shadow_signal_key_is_price_free_and_stable():
+    k = shadow_signal_key("2026-09-24", "SUZLON", "entry_scan_14:00_drop_-3%")
+    assert k == "2026-09-24|SUZLON|entry_scan_14:00_drop_-3%"
+    # same date·symbol·reason → same key regardless of price/qty (dedup across ticks)
+    assert shadow_signal_key("2026-09-24", "SUZLON", "entry_scan_14:00_drop_-3%") == k
+
+
+def test_extract_shadow_buys_keeps_recent_buys_only():
+    trades = [
+        {"date": "2026-09-24", "time": "14:00", "symbol": "AAA", "side": "BUY",
+         "price": 100.0, "reason": "entry_scan_14:00_drop_-3%"},
+        {"date": "2026-09-24", "time": "15:00", "symbol": "AAA", "side": "SELL",
+         "price": 110.0, "reason": "target_1"},            # a sell is not a buy-point
+        {"date": "2026-01-01", "time": "10:00", "symbol": "BBB", "side": "BUY",
+         "price": 50.0, "reason": "entry"},                # too old (outside lookback)
+        {"date": "2099-01-01", "time": "10:00", "symbol": "CCC", "side": "BUY",
+         "price": 5.0, "reason": "entry"},                 # future date — never
+    ]
+    out = extract_shadow_buys(trades, "2026-09-25", lookback_days=45)
+    assert len(out) == 1
+    assert out[0]["symbol"] == "AAA" and out[0]["price"] == 100.0 and out[0]["time"] == "14:00"
+
+
+def test_shadow_buyable_compares_current_price_to_wanted():
+    assert shadow_buyable(100.0, 95.0) is True     # cheaper now → catchable at your price or better
+    assert shadow_buyable(100.0, 100.0) is True    # exactly at the price → still catchable
+    assert shadow_buyable(100.0, 120.0) is False   # ran up
+    assert shadow_buyable(100.0, None) is False     # no candle data → fail closed
+
+
+def test_shadow_config_defaults():
+    from src.core.config import settings
+    assert settings.shadow_buy_points is True
+    assert settings.shadow_lookback_days == 45
+
+
+def test_suspend_stale_days_default_is_five():
+    from src.core.config import settings
+    # bumped 3→5 to cut edge-of-threshold noise from transient multi-day per-symbol data gaps
+    assert settings.suspend_stale_days == 5

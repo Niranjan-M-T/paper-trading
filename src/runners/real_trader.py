@@ -50,7 +50,12 @@ from src.engine.real_executor import (
     split_adjust_position,
     surveillance_reject_code,
     symbol_lag_days,
+    build_shadow_cash,
+    extract_shadow_buys,
+    shadow_signal_key,
+    SHADOW_ALLOC,
 )
+from dataclasses import replace as dc_replace
 from src.engine.corporate_actions import load_active_actions
 from src.engine.replay import (
     PortfolioRow,
@@ -805,9 +810,10 @@ async def emit_suspension_alerts() -> int:
     A symbol is flagged when its freshest 5m candle lags the freshest bar ANYWHERE in the
     universe by >= settings.suspend_stale_days (real_executor.symbol_lag_days — the lag is
     universe-relative, so weekends, holidays and platform-wide data outages never trip it;
-    only a symbol that specifically halts while the market trades on does). Alert-only: it
-    never benches or trades. Deduped once per (symbol, day) via real_signals
-    ('suspend:<symbol>:<date>'); best-effort with the usual 0-delivery circuit breaker."""
+    only a symbol that specifically halts while the market trades on does). Holdings the bot
+    never tracked (no candle at all — e.g. a by-hand buy outside the universe) are skipped, not
+    flagged. Alert-only: it never benches or trades. Deduped once per (symbol, ISO week) via
+    real_signals ('suspend:<symbol>:<isoweek>'); best-effort with the usual 0-delivery circuit breaker."""
     if not whatsapp.configured():
         return 0
     held = await fetch("SELECT symbol, qty FROM real_holdings WHERE qty > 0")
@@ -829,18 +835,24 @@ async def emit_suspension_alerts() -> int:
         CANDLE_INTERVAL, roots,
     )
     latest_by_sym = {r["symbol"]: r["t"] for r in rows}
-    today = now_ist().date().isoformat()
+    week = now_ist().strftime("%G-W%V")  # ISO year-week — alert at most once per week per name
     now_str = now_ist().strftime("%H:%M IST")
     sent = 0
     blocked = False
     for sym in roots:
-        lag = symbol_lag_days(universe_latest, latest_by_sym.get(sym))
+        symbol_latest = latest_by_sym.get(sym)
+        if symbol_latest is None:
+            # Held name the bot never tracked (no candle at all — e.g. a by-hand SUZLON buy
+            # outside the universe). That's 'untracked', not 'suspended': skip the staleness
+            # guard entirely rather than firing a bogus '~1000000 day(s)' delisting alert.
+            continue
+        lag = symbol_lag_days(universe_latest, symbol_latest)
         if lag < settings.suspend_stale_days:
             continue
-        key = f"suspend:{sym}:{today}"
+        key = f"suspend:{sym}:{week}"
         prev = await fetchrow("SELECT sent_ok FROM real_signals WHERE signal_key = $1", key)
         if prev and prev["sent_ok"]:
-            continue  # already alerted for this symbol today
+            continue  # already alerted for this symbol this week
         delivered = 0
         if not blocked:
             text = whatsapp.format_suspension_alert(
@@ -869,6 +881,12 @@ async def emit_suspension_alerts() -> int:
 # before we decide a cash move is unexplained — avoids a false 'withdrawal?' the instant a manual
 # buy debits cash but its order-book row hasn't been tagged yet.
 RECONCILE_LAG = _timedelta(minutes=3)
+# Even settled, cash snapshots and order-book timestamps drift: a by-hand buy can debit cash in
+# one snapshot yet tag its trade row in the next, faking a 'withdrawal' then a 'deposit' (exactly
+# what a manual SUZLON buy did). If ANY bot fill or manual trade sits within this band of the
+# window, treat the move as trade-related and stay silent — real deposits land on quiet days, and
+# the /bot record form is the backstop for a deposit made mid-trade.
+RECONCILE_GUARD = _timedelta(minutes=30)
 
 
 async def emit_cash_reconcile_alerts() -> None:
@@ -903,6 +921,21 @@ async def emit_cash_reconcile_alerts() -> None:
     kind = reconcile_kind(residual, settings.reconcile_alert_threshold)
     if kind is None:
         return
+    # Guard band: if any bot fill or manual trade sits within RECONCILE_GUARD of this window, the
+    # cash move is almost certainly that trade with skewed timestamps — the failure mode that
+    # turned a by-hand SUZLON buy into a phantom 'withdrawal' then 'deposit'. Suppress it.
+    band_start = prev["as_of"] - RECONCILE_GUARD
+    band_end = cur["as_of"] + RECONCILE_GUARD
+    nearby = await fetchrow(
+        "SELECT 1 FROM real_orders "
+        "  WHERE status = 'complete' AND filled_qty > 0 AND updated_at > $1 AND updated_at <= $2 "
+        "UNION ALL "
+        "SELECT 1 FROM manual_trades WHERE order_ts > $1 AND order_ts <= $2 "
+        "LIMIT 1",
+        band_start, band_end,
+    )
+    if nearby is not None:
+        return
     # Queue a one-tap confirmation for the owner, deduped on the detecting snapshot. If a row
     # already exists for this snapshot (pending or already resolved), don't re-queue or re-alert.
     new = await fetchrow(
@@ -917,6 +950,68 @@ async def emit_cash_reconcile_alerts() -> None:
     text = whatsapp.format_cash_reconcile(
         amount=residual, kind=kind, now_ist_str=now_str, confirm_url=confirm_url)
     await whatsapp.broadcast(text)
+
+
+# Throttle the shadow replay: entries only change when a new 5m bar closes, so recomputing the
+# full unlimited-cash replay on every 60s tick is wasted work. Run it at most once per interval,
+# per portfolio (module-global — the trader is one long-running process).
+SHADOW_MIN_INTERVAL = _timedelta(minutes=5)
+_last_shadow_run: dict[int, _datetime] = {}
+
+
+async def emit_shadow_buy_points(
+    p, strategy, p_candles, nifty, sensex, vix, uni_close, uni_breadth, today_str: str,
+) -> int:
+    """Log what the strategy WANTS to buy right now, ignoring how much cash the account holds.
+
+    Runs a SECOND, non-persisting replay of the live portfolio with unlimited simulated cash
+    (build_shadow_cash → cash_override) so every entry the strategy would take fires even when the
+    real account is empty. New recent BUYs are recorded to shadow_buy_points, deduped on
+    date·symbol·reason. Purely informational: it never places an order and never writes to the
+    live portfolio's trades/positions/equity (persist=False). Throttled to SHADOW_MIN_INTERVAL;
+    the caller guards it so a shadow bug can never break the real trading tick. Returns #new rows."""
+    now = now_ist()
+    last = _last_shadow_run.get(p.id)
+    if last is not None and (now - last) < SHADOW_MIN_INTERVAL:
+        return 0
+    if p_candles is None or p_candles.empty:
+        return 0
+    # Unlimited cash on every trading day in the window → no entry is ever gated for funds, and
+    # FIXED-rupee sizing so equity inflation can't re-introduce a gate under pct_equity strategies
+    # (see SHADOW_ALLOC). Candidate selection is upstream of sizing, so this changes only funding,
+    # not which names the strategy wants.
+    day_strings = {d.isoformat() for d in p_candles["timestamp"].dt.date.unique()}
+    shadow_cash = build_shadow_cash(day_strings)
+    shadow_strategy = dc_replace(strategy, allocation_mode="fixed", allocation_per_trade=SHADOW_ALLOC)
+    result = await replay_one_portfolio(
+        p, shadow_strategy, p_candles, CHARGES, nifty, sensex, vix,
+        record_intraday=False, deposits=None, external_positions=None,
+        cash_override=shadow_cash,
+        universe_close=uni_close, universe_breadth=uni_breadth,
+        persist=False,
+    )
+    _last_shadow_run[p.id] = now
+    if result.get("validation_errors"):
+        return 0
+    buys = extract_shadow_buys(result.get("trades", []), today_str, settings.shadow_lookback_days)
+    logged = 0
+    for b in buys:
+        key = shadow_signal_key(b["date"], b["symbol"], b["reason"])
+        row = await fetchrow(
+            """
+            INSERT INTO shadow_buy_points
+                (signal_key, portfolio_id, symbol, signal_date, signal_time, price, reason)
+            VALUES ($1, $2, $3, $4::date, $5, $6, $7)
+            ON CONFLICT (signal_key) DO NOTHING
+            RETURNING id
+            """,
+            key, p.id, b["symbol"], b["date"], b.get("time"), b["price"], b["reason"],
+        )
+        if row is not None:
+            logged += 1
+    if logged:
+        log.info("shadow buy-points logged", extra={"portfolio_id": p.id, "new": logged})
+    return logged
 
 
 async def reconcile_open_orders(client: AngelClient, portfolio_id: int) -> None:
@@ -1105,6 +1200,17 @@ async def tick() -> None:
                 await emit_quarantine_signals(p.id, quarantine_skips)
             except Exception:  # noqa: BLE001
                 log.exception("whatsapp order-signal emit failed", extra={"portfolio_id": p.id})
+
+            # Shadow buy-points — what the strategy WANTS regardless of cash, so a cash-gated dry
+            # spell stays visible (and comparable when a SIP finally lands). Informational only,
+            # in its own guard so a shadow issue can never touch real order placement.
+            if settings.shadow_buy_points:
+                try:
+                    await emit_shadow_buy_points(
+                        p, strategy, p_candles, nifty, sensex, vix,
+                        uni_close, uni_breadth, today_str)
+                except Exception:  # noqa: BLE001
+                    log.exception("shadow buy-point emit failed", extra={"portfolio_id": p.id})
         except Exception:  # noqa: BLE001
             log.exception("live portfolio tick failed",
                           extra={"portfolio_id": p.id, "portfolio_name": p.name})

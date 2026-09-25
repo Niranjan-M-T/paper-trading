@@ -429,9 +429,15 @@ async def replay_one_portfolio(
     cash_override: dict[str, float] | None = None,
     universe_close: pd.Series | None = None,
     universe_breadth: pd.Series | None = None,
+    persist: bool = True,
 ) -> dict:
     """Run the engine for this portfolio against the given candles window.
-    Returns the engine's full result dict and persists trades / positions / equity.
+    Returns the engine's full result dict and (when `persist`) writes trades / positions / equity.
+
+    `persist=False` runs a pure, read-only replay: it computes and returns the result but writes
+    NOTHING to the DB. Used by the shadow buy-point pass, which replays the live portfolio with
+    unlimited simulated cash — that fantasy trade list must never overwrite the live portfolio's
+    real trades/positions/equity, so the shadow caller passes persist=False.
 
     `vix_close` is the INDIA_VIX daily-close series — required by multi-regime
     strategies (S228/S283) for the VIX-fear regime override; harmless if absent.
@@ -486,28 +492,29 @@ async def replay_one_portfolio(
                              external_positions=external_positions,
                              cash_override=cash_override)
 
-    # Persist. Prefer the engine's full holdings dict (carries adopted positions, which
-    # have no BUY trade and so can't be reconstructed from the trade list); fall back to
-    # the trade-replay reconstruction for older engine outputs.
-    await upsert_trades(portfolio.id, result["trades"])
-    holdings_state = result.get("holdings_state")
-    if not holdings_state:
-        holdings_state = _holdings_from_open_positions(result["open_positions"], result["trades"])
-    await replace_positions(portfolio.id, holdings_state)
-    await upsert_equity_curve(portfolio.id, result["equity_curve"])
+    if persist:
+        # Persist. Prefer the engine's full holdings dict (carries adopted positions, which
+        # have no BUY trade and so can't be reconstructed from the trade list); fall back to
+        # the trade-replay reconstruction for older engine outputs.
+        await upsert_trades(portfolio.id, result["trades"])
+        holdings_state = result.get("holdings_state")
+        if not holdings_state:
+            holdings_state = _holdings_from_open_positions(result["open_positions"], result["trades"])
+        await replace_positions(portfolio.id, holdings_state)
+        await upsert_equity_curve(portfolio.id, result["equity_curve"])
 
-    # Real-time overlay: one live equity point per tick (market hours only, set by
-    # the trader). Derived from the engine's last daily point so the dashboard
-    # reflects the current session at minute resolution.
-    if record_intraday and result["equity_curve"]:
-        last = result["equity_curve"][-1]
-        await upsert_intraday_equity(
-            portfolio.id,
-            cash=last["cash"],
-            holdings_value=last["holdings_value"],
-            equity=last["equity"],
-            open_positions=int(last["open_positions"]),
-        )
+        # Real-time overlay: one live equity point per tick (market hours only, set by
+        # the trader). Derived from the engine's last daily point so the dashboard
+        # reflects the current session at minute resolution.
+        if record_intraday and result["equity_curve"]:
+            last = result["equity_curve"][-1]
+            await upsert_intraday_equity(
+                portfolio.id,
+                cash=last["cash"],
+                holdings_value=last["holdings_value"],
+                equity=last["equity"],
+                open_positions=int(last["open_positions"]),
+            )
 
     log.info(
         "replay completed",

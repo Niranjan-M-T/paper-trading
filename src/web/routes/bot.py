@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from src.core import whatsapp
 from src.core.config import settings
 from src.core.db import execute, fetch, fetchrow
+from src.engine.real_executor import shadow_buyable
 from src.core.logtail import read_log_tail
 from src.core.metrics import days_live, estimated_apy, split_pnl
 from src.core.time import IST, is_market_open, now_ist
@@ -93,6 +94,45 @@ async def bot_page(request: Request) -> HTMLResponse:
         "FROM cash_reconcile WHERE status = 'pending' ORDER BY detected_at DESC"
     )
 
+    # Shadow buy-points: entries the strategy WANTED while cash-gated, joined against live
+    # candles so you can see, per name, whether it's still catchable at that price or lower.
+    shadow_rows = await fetch(
+        """
+        SELECT s.symbol, s.signal_date, s.signal_time, s.price::float8 AS price, s.reason,
+               lo.low_since::float8 AS low_since, lp.last_price::float8 AS last_price
+        FROM shadow_buy_points s
+        LEFT JOIN LATERAL (
+            SELECT MIN(low) AS low_since FROM candles
+            WHERE symbol = s.symbol AND interval = '5m' AND ts >= s.signal_date
+        ) lo ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT close AS last_price FROM candles
+            WHERE symbol = s.symbol AND interval = '5m' ORDER BY ts DESC LIMIT 1
+        ) lp ON TRUE
+        WHERE s.signal_date >= (CURRENT_DATE - $1::int)
+        ORDER BY s.signal_date DESC, s.symbol
+        LIMIT 100
+        """,
+        settings.shadow_lookback_days,
+    )
+    shadow_points = []
+    for r in shadow_rows:
+        price = float(r["price"])
+        last_price = float(r["last_price"]) if r["last_price"] is not None else None
+        low_since = float(r["low_since"]) if r["low_since"] is not None else None
+        pct = ((last_price - price) / price * 100.0) if (last_price and price) else None
+        shadow_points.append({
+            "symbol": r["symbol"],
+            "signal_date": r["signal_date"],
+            "signal_time": r["signal_time"],
+            "price": price,
+            "reason": r["reason"],
+            "last_price": last_price,
+            "low_since": low_since,
+            "buyable": shadow_buyable(price, last_price),
+            "pct": pct,
+        })
+
     return request.app.state.templates.TemplateResponse(
         request, "bot.html",
         {
@@ -104,6 +144,7 @@ async def bot_page(request: Request) -> HTMLResponse:
             "deposits": [dict(r) for r in deposits],
             "total_deposited": total_deposited,
             "pending_reconcile": [dict(r) for r in pending_reconcile],
+            "shadow_points": shadow_points,
             "market_open": is_market_open(),
         },
     )
