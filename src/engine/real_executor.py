@@ -439,6 +439,144 @@ def shadow_buyable(target_price: float, price_now: float | None) -> bool:
     return float(price_now) <= float(target_price)
 
 
+# ---------- "why isn't it buying?" diagnostics ----------
+
+_MODE_FIELD = {"bull": "mode_params_bull", "bear": "mode_params_bear", "sideways": "mode_params_sideways"}
+
+
+def effective_entry_params(strategy, regime: str | None) -> dict:
+    """The entry parameters the engine actually applies on a day in `regime`. Pure, duck-typed.
+
+    Mirrors v2_engine's per-day mode resolution (`_meff`, ~line 1009): on a multi-mode strategy the
+    regime label (bull/bear/sideways) SWAPS the entry parameters rather than blocking entries — a
+    mode field left None falls back to the base strategy value. `regime` None (single-mode) → base
+    values. macd_filter "__off__" and sma_above_prev -1 are the engine's explicit-disable sentinels
+    (~line 1018) and resolve to None here too."""
+    mode = getattr(strategy, _MODE_FIELD[regime], None) if regime in _MODE_FIELD else None
+
+    def eff(field: str):
+        if mode is not None:
+            v = getattr(mode, field, None)
+            if v is not None:
+                return v
+        return getattr(strategy, field, None)
+
+    macd = eff("macd_filter")
+    sma = eff("sma_above_prev")
+    return {
+        "fall_threshold": eff("fall_threshold"),
+        "volume_spike_min": eff("volume_spike_min"),
+        "macd_filter": None if macd == "__off__" else macd,
+        "sma_above_prev": None if sma == -1 else sma,
+        "allocation_pct": eff("allocation_pct"),
+        "max_new_buys_per_day": eff("max_new_buys_per_day"),
+    }
+
+
+def estimate_position_size(allocation_mode: str | None, allocation_pct: float | None,
+                           allocation_per_trade: float | None, equity: float, cash: float) -> float | None:
+    """Rupees the engine would put into ONE new entry right now (v2_engine ~line 1502). Pure.
+
+    pct_equity → equity × pct; pct_cash → cash × pct; anything else ("fixed") → allocation_per_trade.
+    Approximate: ignores the drawdown governor / half-life boost multipliers, which only shrink or
+    nudge it. None when the inputs to size it are missing."""
+    if allocation_mode == "pct_equity":
+        return None if allocation_pct is None else max(float(equity) * float(allocation_pct), 0.0)
+    if allocation_mode == "pct_cash":
+        return None if allocation_pct is None else max(float(cash) * float(allocation_pct), 0.0)
+    return None if allocation_per_trade is None else float(allocation_per_trade)
+
+
+def entry_requirements(params: dict) -> list[str]:
+    """Human wording for the effective entry filters (from effective_entry_params). Pure.
+
+    Semantics read from v2_engine, not guessed: macd "positive" = MACD histogram > 0, "rising" =
+    histogram above its value 3 days ago; sma_above_prev N = YESTERDAY's close ≥ its N-day SMA."""
+    out: list[str] = []
+    fall = params.get("fall_threshold")
+    if fall is not None:
+        out.append(f"≥{abs(float(fall)) * 100:.1f}% drop")
+    vol = params.get("volume_spike_min")
+    if vol is not None:
+        out.append(f"≥{float(vol):g}× usual volume")
+    macd = params.get("macd_filter")
+    if macd == "positive":
+        out.append("MACD histogram > 0")
+    elif macd == "rising":
+        out.append("MACD histogram rising")
+    elif macd:
+        out.append(f"MACD {macd}")
+    sma = params.get("sma_above_prev")
+    if sma:
+        out.append(f"above its {int(sma)}-day SMA yesterday")
+    return out
+
+
+def _hhmm_plus(hhmm: str, minutes: int) -> str:
+    return (datetime.strptime(hhmm, "%H:%M") + timedelta(minutes=minutes)).strftime("%H:%M")
+
+
+def entry_verdict(diag: dict | None, *, bot_enabled: bool, today_str: str, now_hhmm: str,
+                  is_weekday: bool) -> tuple[str, str]:
+    """One-line answer to "why isn't it buying?" → (code, headline). Pure.
+
+    `diag` is the payload the trader persists to entry_diagnostics every shadow pass; the web adds
+    the render-time facts (bot switch, date, clock). Precedence, most specific first:
+    no data → bot OFF → bought today → wanted-but-not-bought (bench / cash floor / cash / share
+    price / placement) → weekend → stale trader → no market data (holiday) → before first scan →
+    no setups (with the regime's entry requirements + the closest miss)."""
+    if not diag:
+        return ("nodata", "No diagnostics yet — the trader writes them every few minutes while it runs.")
+    if not bot_enabled:
+        return ("off", "The bot is switched OFF, so it won't place orders — the strategy is still tracked below.")
+    fresh = diag.get("date") == today_str
+    wanted = (diag.get("wanted_today") or []) if fresh else []
+    bought = (diag.get("bought_today") or []) if fresh else []
+    if bought:
+        return ("bought", f"Bought today: {', '.join(bought)}.")
+    if wanted:
+        names = ", ".join(w["symbol"] for w in wanted)
+        benched = set(diag.get("quarantined") or [])
+        if all(w["symbol"] in benched for w in wanted):
+            return ("quarantined", f"The strategy wanted {names}, but it's on the surveillance bench "
+                                   f"(AB4036) — the broker blocks it; buy by hand if you want it.")
+        free, pos, floor = diag.get("free_cash"), diag.get("position_size"), diag.get("min_entry_cash")
+        if floor is not None and free is not None and free < floor:
+            return ("cash", f"Cash-gated: the strategy wanted {names}, but free cash ₹{free:,.0f} is "
+                            f"below the ₹{floor:,.0f} entry floor.")
+        if free is not None and pos is not None and free < pos:
+            return ("cash", f"Cash-gated: the strategy wanted {names}, but free cash ₹{free:,.0f} is "
+                            f"below one position (~₹{pos:,.0f}).")
+        if pos is not None:
+            too_dear = [w["symbol"] for w in wanted if w.get("price") and float(w["price"]) > pos]
+            if too_dear:
+                return ("size", f"Position too small: ~₹{pos:,.0f} per position can't buy one share "
+                                f"of {', '.join(too_dear)}.")
+        return ("pending", f"The strategy wanted {names} today but no order is on the books — "
+                           f"check the orders table for a rejection.")
+    if not is_weekday:
+        return ("closed", "Market's closed for the weekend — next scans on Monday.")
+    scans = sorted(diag.get("scan_times") or [])
+    if not fresh:
+        if scans and now_hhmm >= _hhmm_plus(scans[0], 5):
+            return ("stale", "No update from the trader today — check that paperaglo-real-trader is running.")
+        return ("waiting", f"Waiting for today's first scan at {scans[0]}." if scans else "Waiting for today's scans.")
+    if not diag.get("today_bars"):
+        return ("holiday", "No market data today — likely an exchange holiday.")
+    if scans and now_hhmm < _hhmm_plus(scans[0], 5):
+        return ("waiting", f"Waiting for today's first scan at {scans[0]}.")
+    so_far = " so far" if scans and now_hhmm < _hhmm_plus(scans[-1], 5) else ""
+    regime = diag.get("regime")
+    reg = f" ({regime} regime)" if regime else ""
+    reqs = entry_requirements(diag.get("params") or {})
+    need = " · ".join(reqs) if reqs else "its entry trigger"
+    head = f"No setups{so_far} today{reg} — entries need {need}."
+    near = diag.get("nearest") or []
+    if near:
+        head += f" Closest: {near[0]['symbol']} {float(near[0]['change']) * 100:+.1f}%."
+    return ("no_setup", head)
+
+
 def sip_deposit_amount(
     account_net: float | None,
     expected_baseline: float,

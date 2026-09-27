@@ -262,9 +262,12 @@ Fix in `emit_cash_reconcile_alerts`: a **guard band** (`RECONCILE_GUARD`, ±30 m
 or manual trade sits near the cash-move window, treat the move as trade-related and stay silent. Real
 deposits land on quiet days; the /bot record form is the backstop for a deposit made mid-trade.
 
-**Feature — shadow buy-points.** Each tick, after the real replay, a **second, non-persisting**
-replay runs the live portfolio with unlimited cash so the strategy emits every entry it *wants*, even
-cash-gated. New recent BUYs are logged to `shadow_buy_points` (`sql/016`), and `/bot` joins them
+**Feature — shadow buy-points.** An **always-on** pass (`run_shadow_pass`, runs whether the bot's
+master switch is ON or OFF, so a paused/no-money stretch still accrues wants) does a **second,
+non-persisting** replay of the live portfolio with unlimited cash so the strategy emits every entry
+it *wants*, even cash-gated. It self-loads candles/indices and is globally throttled (gated *before*
+any candle load, so a throttled tick is nearly free). New recent BUYs are logged to
+`shadow_buy_points` (`sql/016`), and `/bot` joins them
 against live candles to show, per name: wanted @ ₹P, price now, and whether it's still catchable at
 ≤ P. Key mechanics: `replay_one_portfolio(..., persist=False)` (new flag — the fantasy trade list
 must never overwrite the live portfolio's trades/positions/equity); `cash_override` set huge for
@@ -275,6 +278,58 @@ Candidate selection is upstream of sizing, so fixed sizing changes only funding,
 Purely informational — never places an order; throttled to once per 5 min; fully guarded so a shadow
 bug can't break real trading; default on (`SHADOW_BUY_POINTS`), lookback `SHADOW_LOOKBACK_DAYS=45`.
 Tests: 41/41. Deploy: run `sql/016` **before** the `pm2 restart` (the /bot page reads the table).
+
+**Bug found after push (c897368) — the shadow logger never logged anything.** The INSERT passed the
+ISO *string* `b["date"]` to `signal_date` (a `DATE`); asyncpg rejects a `str` for a date parameter,
+so every insert raised, the guard swallowed it (`shadow buy-point emit failed` in the log), and the
+table stayed empty. Fixed with `_date.fromisoformat(...)`. Also fixed: today's entries are now logged
+only once `scan_time_elapsed` (scan + 5 min) — the same provisional-bar gate the real order path uses
+— so a still-forming bar can't permanently log a want that disappears when the bar closes. Lesson:
+**asyncpg DATE params must be `datetime.date` objects**; a guard that swallows exceptions needs a test
+that the happy path actually writes.
+
+## 2026-09-25 — "Why isn't it buying?" panel + daily P&L digest
+
+Owner asked what else to add; picked these two. Motivation: S404 went long stretches with no buys and
+the only way to know why was to read the engine.
+
+**Root cause it surfaces (read from v2_engine, not guessed).** S404 is multi-mode
+(`mode_params_bull/bear/sideways`), and the regime label **swaps the entry parameters, it does not
+block entries** (`regime_filter` is the blocking mechanism; S404 has it off). In a **bear** regime an
+entry needs, all at once: a ≥3.0% drop, ≥1.2× usual volume, MACD histogram > 0, and yesterday's close
+≥ its 20-day SMA — a stock that just fell 3% on volume rarely has a positive MACD histogram *and* sits
+above its SMA20, so bear stretches are near-droughts by design. ("side_only" in the name refers only to
+the S392 exit ladder in sideways mode.)
+
+**Panel (`/bot`, "🤔 Why isn't it buying?").** Every shadow pass the trader writes one
+`entry_diagnostics` row per live portfolio (`sql/017`, JSONB, overwritten): the regime the engine uses
+today — classified with `classify_regime_by_date` on **the strategy's own** source/hysteresis/VIX params
+after applying dashboard overrides (`load_effective_strategy`), primed exactly as `replay_one_portfolio`
+primes it (replay clears + re-primes on every call, so this can't leak into trading) — that regime's
+effective entry filters (`effective_entry_params`, mirroring `_meff` + the `__off__`/`-1` sentinels),
+free cash vs one position (`estimate_position_size`), today's scan-complete shadow wants, today's bot
+BUYs, the bench, the last filled buy, and today's biggest fallers among names not held. The page turns it
+into one sentence with `entry_verdict` (pure, precedence-ordered: no data → bot OFF → bought → wanted but
+not bought [bench / cash floor / cash < one position / share price > position / check rejections] →
+weekend → trader stale → holiday → before first scan → "no setups today (bear regime) — entries need
+… Closest: X −2.1%"). The read is guarded so a missing table can never 500 the page that hosts the
+master switch. `run_shadow_pass` now stamps its throttle *before* the work (a failing pass backs off
+5 min instead of reloading candles every tick) and guards emit and diagnostics per portfolio.
+
+**Digest (`tools/daily_digest.py`, PM2 `paperaglo-daily-digest`, weekdays 15:35 IST).** WhatsApp
+end-of-day: net worth, P&L since the last digest, total P&L (+%) on invested, realized/unrealized —
+the **same queries + `split_pnl` as `/api/bot/stats`** so the two can't disagree — today's fills (bot
+and manual), and when the bot is ON and bought nothing, the verdict line + what the shadow wanted.
+Send-once via a `real_signals` `INFO` row `digest:<date>` whose `price` stores that day's total P&L, so
+the next day's "since" figure is a difference of two deposit-adjusted snapshots (a deposit moves net
+worth and invested equally and cancels). Holiday (no candles — checked first, since the trader still
+syncs the broker on a holiday) and "trader never synced today" each send a short heads-up instead. The
+script skips itself outside weekdays-after-15:30 unless `--force`, because PM2 also runs a
+`cron_restart` app on every start/restart/resurrect — without that, a mid-day deploy would send a
+half-day digest and mark the date sent. `--dry-run` prints without sending or recording.
+Tests: 51/51 (+ a template render check and the real `_nearest_misses` source exercised on pandas).
+Deploy: `sql/017` **before** restarting `paperaglo-real-trader` + `paperaglo-web`, then start the
+digest app and `pm2 save`.
 
 ## Prior context (before this log's window)
 

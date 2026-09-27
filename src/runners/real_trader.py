@@ -54,18 +54,26 @@ from src.engine.real_executor import (
     extract_shadow_buys,
     shadow_signal_key,
     SHADOW_ALLOC,
+    effective_entry_params,
+    estimate_position_size,
 )
 from dataclasses import replace as dc_replace
 from src.engine.corporate_actions import load_active_actions
 from src.engine.replay import (
     PortfolioRow,
     load_candles_window,
+    load_effective_strategy,
     load_index_close,
     load_portfolios,
     replay_one_portfolio,
     universe_index_if_needed,
 )
-from src.engine.v2_engine import ChargeConfigV2
+from src.engine.v2_engine import (
+    ChargeConfigV2,
+    classify_regime_by_date,
+    clear_regime_cache,
+    prime_regime_index,
+)
 from src.strategies.registry import get as get_strategy
 
 
@@ -952,11 +960,11 @@ async def emit_cash_reconcile_alerts() -> None:
     await whatsapp.broadcast(text)
 
 
-# Throttle the shadow replay: entries only change when a new 5m bar closes, so recomputing the
-# full unlimited-cash replay on every 60s tick is wasted work. Run it at most once per interval,
-# per portfolio (module-global — the trader is one long-running process).
+# Throttle the shadow pass: entries only change when a new 5m bar closes, so recomputing the full
+# unlimited-cash replay on every 60s tick is wasted work. Run it at most once per interval, gated
+# BEFORE any candle load (module-global — the trader is one long-running process).
 SHADOW_MIN_INTERVAL = _timedelta(minutes=5)
-_last_shadow_run: dict[int, _datetime] = {}
+_last_shadow_pass: _datetime | None = None
 
 
 async def emit_shadow_buy_points(
@@ -968,12 +976,8 @@ async def emit_shadow_buy_points(
     (build_shadow_cash → cash_override) so every entry the strategy would take fires even when the
     real account is empty. New recent BUYs are recorded to shadow_buy_points, deduped on
     date·symbol·reason. Purely informational: it never places an order and never writes to the
-    live portfolio's trades/positions/equity (persist=False). Throttled to SHADOW_MIN_INTERVAL;
-    the caller guards it so a shadow bug can never break the real trading tick. Returns #new rows."""
-    now = now_ist()
-    last = _last_shadow_run.get(p.id)
-    if last is not None and (now - last) < SHADOW_MIN_INTERVAL:
-        return 0
+    live portfolio's trades/positions/equity (persist=False). The caller (run_shadow_pass) throttles
+    and guards it, so a shadow bug can never break the real trading tick. Returns #new rows logged."""
     if p_candles is None or p_candles.empty:
         return 0
     # Unlimited cash on every trading day in the window → no entry is ever gated for funds, and
@@ -990,10 +994,14 @@ async def emit_shadow_buy_points(
         universe_close=uni_close, universe_breadth=uni_breadth,
         persist=False,
     )
-    _last_shadow_run[p.id] = now
     if result.get("validation_errors"):
         return 0
     buys = extract_shadow_buys(result.get("trades", []), today_str, settings.shadow_lookback_days)
+    # Mirror the live bot's provisional-scan gate: today's scan entry is evaluated on a still-forming
+    # bar until scan_time + one bar, so logging it early could record an entry that later stops
+    # qualifying (the key is price-free, so it would stick). Past days are complete — never gated.
+    now_hhmm = now_ist().strftime("%H:%M")
+    buys = [b for b in buys if b["date"] != today_str or scan_time_elapsed(b["reason"], now_hhmm)]
     logged = 0
     for b in buys:
         key = shadow_signal_key(b["date"], b["symbol"], b["reason"])
@@ -1001,17 +1009,183 @@ async def emit_shadow_buy_points(
             """
             INSERT INTO shadow_buy_points
                 (signal_key, portfolio_id, symbol, signal_date, signal_time, price, reason)
-            VALUES ($1, $2, $3, $4::date, $5, $6, $7)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (signal_key) DO NOTHING
             RETURNING id
             """,
-            key, p.id, b["symbol"], b["date"], b.get("time"), b["price"], b["reason"],
+            # asyncpg is strict: a DATE parameter must be a datetime.date, never an ISO string.
+            key, p.id, b["symbol"], _date.fromisoformat(b["date"]), b.get("time"), b["price"], b["reason"],
         )
         if row is not None:
             logged += 1
     if logged:
         log.info("shadow buy-points logged", extra={"portfolio_id": p.id, "new": logged})
     return logged
+
+
+def _prime_regime(nifty, sensex, vix, uni_close, uni_breadth) -> None:
+    """Prime the engine's regime-index cache exactly as replay_one_portfolio does, so a standalone
+    classify_regime_by_date call sees the same inputs the engine does. The real replay later
+    clears + re-primes for itself, so this never leaks into trading."""
+    clear_regime_cache()
+    if not nifty.empty:
+        prime_regime_index("NIFTY_50", nifty)
+    if not sensex.empty:
+        prime_regime_index("SENSEX", sensex)
+    if vix is not None and not vix.empty:
+        prime_regime_index("INDIA_VIX", vix)
+    if uni_close is not None and not uni_close.empty:
+        prime_regime_index("UNIVERSE", uni_close)
+    if uni_breadth is not None and not uni_breadth.empty:
+        prime_regime_index("UNIVERSE_BREADTH", uni_breadth)
+
+
+def _nearest_misses(candles, today_str: str, exclude: set[str], n: int = 3) -> tuple[list[dict], int]:
+    """Today's biggest decliners vs the previous close, among names NOT already held (the engine
+    skips held names for a new entry). Returns (top-n [{symbol, change}], today's bar count). Uses
+    the loader's engine-style `date` column; compared as ISO strings so it's dtype-agnostic."""
+    if candles is None or candles.empty:
+        return [], 0
+    df = candles[["symbol", "timestamp", "close", "date"]]
+    d = df["date"].astype(str)
+    today_rows = df[d == today_str]
+    if today_rows.empty:
+        return [], 0
+    last = today_rows.sort_values("timestamp").groupby("symbol")["close"].last()
+    prev = df[d < today_str].sort_values("timestamp").groupby("symbol")["close"].last()
+    chg = (last / prev - 1.0).dropna()
+    chg = chg[~chg.index.isin(list(exclude))].sort_values()
+    top = [{"symbol": str(s), "change": round(float(v), 4)} for s, v in chg.head(n).items()]
+    return top, int(len(today_rows))
+
+
+async def write_entry_diagnostics(p, strategy, candles, nifty, sensex, vix, uni_close, uni_breadth,
+                                  today_str: str) -> None:
+    """Persist the "why isn't it buying?" evidence for one live portfolio (entry_diagnostics).
+
+    Regime: primed + classified exactly as the engine does for this strategy (v2_engine ~862 — the
+    strategy's own source / hysteresis / VIX params, with dashboard overrides applied via
+    load_effective_strategy, and the same `.get(day, "sideways")` lookup), so the label shown is the
+    one the engine actually uses today. On a multi-mode strategy that label swaps the entry
+    parameters (effective_entry_params) rather than blocking. The rest is broker + DB evidence:
+    free cash vs one position, today's scan-complete shadow wants, today's bot BUYs, the benched
+    set, the bot's last filled buy, and today's closest near-misses. Informational only."""
+    eff = await load_effective_strategy(p, strategy)
+    if eff is None:
+        return
+    today = _date.fromisoformat(today_str)
+    regime = None
+    if (eff.mode_params_bull is not None or eff.mode_params_bear is not None
+            or eff.mode_params_sideways is not None):  # == v2_engine _use_multiregime
+        _prime_regime(nifty, sensex, vix, uni_close, uni_breadth)
+        mode_by_date = classify_regime_by_date(
+            vix_bear_threshold=eff.vix_bear_threshold,
+            vix_only_bear=eff.vix_only_bear,
+            source=eff.mode_regime_source,
+            hysteresis_days=eff.mode_hysteresis_days,
+            crash_overlay_pct=eff.mode_crash_overlay_pct,
+            vix_percentile=eff.mode_vix_percentile,
+        )
+        regime = str(mode_by_date.get(today, "sideways"))
+    params = effective_entry_params(eff, regime)
+
+    f = await fetchrow("SELECT available_cash::float8 AS cash FROM real_funds ORDER BY as_of DESC LIMIT 1")
+    free_cash = float(f["cash"]) if f and f["cash"] is not None else None
+    held = await fetch(
+        "SELECT symbol, (qty * COALESCE(ltp, avg_price))::float8 AS v FROM real_holdings WHERE qty > 0")
+    equity = (free_cash or 0.0) + sum(float(r["v"] or 0.0) for r in held)
+    position = estimate_position_size(eff.allocation_mode, params["allocation_pct"],
+                                      eff.allocation_per_trade, equity, free_cash or 0.0)
+
+    # asyncpg DATE params must be datetime.date objects (never ISO strings).
+    wanted = await fetch(
+        "SELECT symbol, price::float8 AS price FROM shadow_buy_points "
+        "WHERE portfolio_id = $1 AND signal_date = $2 ORDER BY symbol",
+        p.id, today,
+    )
+    bought = await fetch(
+        "SELECT DISTINCT symbol FROM real_orders WHERE portfolio_id = $1 AND side = 'BUY' "
+        "AND status NOT IN ('rejected', 'cancelled', 'error') "
+        "AND (requested_at AT TIME ZONE 'Asia/Kolkata')::date = $2 ORDER BY symbol",
+        p.id, today,
+    )
+    last_buy = await fetchrow(
+        "SELECT MAX((updated_at AT TIME ZONE 'Asia/Kolkata')::date) AS d FROM real_orders "
+        "WHERE portfolio_id = $1 AND side = 'BUY' AND status = 'complete'",
+        p.id,
+    )
+    quarantined = await active_quarantine_symbols()
+    nearest, today_bars = _nearest_misses(
+        candles, today_str, {engine_symbol_root(r["symbol"]) for r in held})
+
+    payload = {
+        "date": today_str,
+        "as_of": now_ist().isoformat(),
+        "strategy": p.strategy_id,
+        "regime": regime,
+        "params": params,
+        "scan_times": list(eff.scan_times or (eff.scan_time,)),  # engine's own fallback
+        "free_cash": free_cash,
+        "equity": round(equity, 2),
+        "position_size": round(position, 2) if position is not None else None,
+        "min_entry_cash": eff.min_entry_cash,
+        "wanted_today": [{"symbol": r["symbol"], "price": float(r["price"])} for r in wanted],
+        "bought_today": [r["symbol"] for r in bought],
+        "quarantined": sorted(quarantined),
+        "last_buy_date": last_buy["d"].isoformat() if last_buy and last_buy["d"] else None,
+        "nearest": nearest,
+        "today_bars": today_bars,
+    }
+    await conn_execute(
+        "INSERT INTO entry_diagnostics (portfolio_id, computed_at, payload) VALUES ($1, now(), $2::jsonb) "
+        "ON CONFLICT (portfolio_id) DO UPDATE SET computed_at = now(), payload = EXCLUDED.payload",
+        p.id, json.dumps(payload, default=str),
+    )
+
+
+async def run_shadow_pass() -> None:
+    """Always-on shadow buy-point logging — runs whether the bot's master switch is ON or OFF, so
+    'what would the strategy buy if it had money' keeps accruing even while the bot is paused (the
+    exact stretch the owner cares about). Globally throttled to SHADOW_MIN_INTERVAL and gated BEFORE
+    any candle load, so a throttled tick is nearly free. Loads its own candles/indices so it's
+    independent of the trading path. Informational only — never places an order."""
+    global _last_shadow_pass
+    if not settings.shadow_buy_points:
+        return
+    now = now_ist()
+    if _last_shadow_pass is not None and (now - _last_shadow_pass) < SHADOW_MIN_INTERVAL:
+        return
+    # Stamp BEFORE the work: a pass that raises (DB hiccup, bad candle) backs off for the full
+    # interval instead of re-loading the whole candle window on every tick.
+    _last_shadow_pass = now
+    portfolios = await load_portfolios(live=True)
+    if not portfolios:
+        return
+    equities, _indices = await load_universe()
+    equity_symbols = [s.symbol for s in equities]
+    until = now.replace(second=0, microsecond=0)
+    earliest_start = min(p.started_at for p in portfolios)
+    candles = await load_candles_window(equity_symbols, CANDLE_INTERVAL, earliest_start, until)
+    nifty = await load_index_close("NIFTY_50", interval="1d")
+    sensex = await load_index_close("SENSEX", interval="1d")
+    vix = await load_index_close("INDIA_VIX", interval="1d")
+    uni_close, uni_breadth = await universe_index_if_needed(portfolios, equity_symbols, until)
+    today_str = now.date().isoformat()
+    for p in portfolios:
+        strategy = get_strategy(p.strategy_id)
+        p_candles = candles if candles.empty else candles[candles["timestamp"] >= p.started_at]
+        # Independent guards: one portfolio's failure (or the diagnostics failing) never hides
+        # another's shadow log. Diagnostics run second so "wanted today" includes this pass.
+        try:
+            await emit_shadow_buy_points(
+                p, strategy, p_candles, nifty, sensex, vix, uni_close, uni_breadth, today_str)
+        except Exception:  # noqa: BLE001
+            log.exception("shadow buy-point emit failed", extra={"portfolio_id": p.id})
+        try:
+            await write_entry_diagnostics(
+                p, strategy, p_candles, nifty, sensex, vix, uni_close, uni_breadth, today_str)
+        except Exception:  # noqa: BLE001
+            log.exception("entry diagnostics failed", extra={"portfolio_id": p.id})
 
 
 async def reconcile_open_orders(client: AngelClient, portfolio_id: int) -> None:
@@ -1084,6 +1258,13 @@ async def tick() -> None:
         await emit_cash_reconcile_alerts()
     except Exception:  # noqa: BLE001
         log.exception("cash reconcile check failed")
+    # Shadow buy-points — what the strategy WANTS regardless of cash. ALWAYS-ON (runs whether the
+    # bot is ON or OFF), so a no-money / paused stretch still shows what it wanted. Never trades;
+    # its own guard so a shadow issue never touches the tick.
+    try:
+        await run_shadow_pass()
+    except Exception:  # noqa: BLE001
+        log.exception("shadow buy-point pass failed")
 
     # 2. Master switch.
     if not await bot_enabled():
@@ -1200,17 +1381,6 @@ async def tick() -> None:
                 await emit_quarantine_signals(p.id, quarantine_skips)
             except Exception:  # noqa: BLE001
                 log.exception("whatsapp order-signal emit failed", extra={"portfolio_id": p.id})
-
-            # Shadow buy-points — what the strategy WANTS regardless of cash, so a cash-gated dry
-            # spell stays visible (and comparable when a SIP finally lands). Informational only,
-            # in its own guard so a shadow issue can never touch real order placement.
-            if settings.shadow_buy_points:
-                try:
-                    await emit_shadow_buy_points(
-                        p, strategy, p_candles, nifty, sensex, vix,
-                        uni_close, uni_breadth, today_str)
-                except Exception:  # noqa: BLE001
-                    log.exception("shadow buy-point emit failed", extra={"portfolio_id": p.id})
         except Exception:  # noqa: BLE001
             log.exception("live portfolio tick failed",
                           extra={"portfolio_id": p.id, "portfolio_name": p.name})

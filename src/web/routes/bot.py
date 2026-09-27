@@ -17,6 +17,7 @@ JSON polling endpoints:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -25,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from src.core import whatsapp
 from src.core.config import settings
 from src.core.db import execute, fetch, fetchrow
-from src.engine.real_executor import shadow_buyable
+from src.engine.real_executor import entry_requirements, entry_verdict, shadow_buyable
 from src.core.logtail import read_log_tail
 from src.core.metrics import days_live, estimated_apy, split_pnl
 from src.core.time import IST, is_market_open, now_ist
@@ -133,10 +134,41 @@ async def bot_page(request: Request) -> HTMLResponse:
             "pct": pct,
         })
 
+    # "Why isn't it buying?" — the trader persists the evidence every shadow pass; the verdict adds
+    # the render-time facts (switch, clock). Guarded on its own: this page hosts the master switch,
+    # so a missing entry_diagnostics table (sql/017 not applied yet) must never 500 it.
+    bot_enabled = bool(bot["enabled"]) if bot else False
+    why = None
+    if live_pf:
+        diag, diag_at, diag_error = None, None, False
+        try:
+            drow = await fetchrow(
+                "SELECT computed_at, payload FROM entry_diagnostics WHERE portfolio_id = $1", live_pf["id"])
+        except Exception:  # noqa: BLE001
+            drow, diag_error = None, True
+        if drow:
+            diag = drow["payload"]
+            if isinstance(diag, str):  # no jsonb codec registered — asyncpg hands back text
+                diag = json.loads(diag)
+            diag_at = drow["computed_at"]
+        now = now_ist()
+        code, headline = entry_verdict(
+            diag, bot_enabled=bot_enabled, today_str=now.date().isoformat(),
+            now_hhmm=now.strftime("%H:%M"), is_weekday=now.weekday() < 5)
+        if diag_error:
+            code, headline = "nodata", "Diagnostics unavailable — is sql/017_entry_diagnostics.sql applied?"
+        why = {
+            "code": code,
+            "headline": headline,
+            "computed_at": diag_at,
+            "d": diag,
+            "requirements": entry_requirements((diag or {}).get("params") or {}),
+        }
+
     return request.app.state.templates.TemplateResponse(
         request, "bot.html",
         {
-            "bot_enabled": bool(bot["enabled"]) if bot else False,
+            "bot_enabled": bot_enabled,
             "bot_note": bot["note"] if bot else None,
             "bot_updated_at": bot["updated_at"] if bot else None,
             "live_pf": dict(live_pf) if live_pf else None,
@@ -145,6 +177,7 @@ async def bot_page(request: Request) -> HTMLResponse:
             "total_deposited": total_deposited,
             "pending_reconcile": [dict(r) for r in pending_reconcile],
             "shadow_points": shadow_points,
+            "why": why,
             "market_open": is_market_open(),
         },
     )

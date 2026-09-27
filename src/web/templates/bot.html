@@ -73,6 +73,67 @@
   {% if funds and funds.as_of %}Funds as of: {{ funds.as_of | ist }}{% endif %}
 </p>
 
+{% if why %}
+<!-- Why isn't it buying? — verdict from real_executor.entry_verdict over the trader's entry_diagnostics -->
+{% set why_color = {"bought": "#22c55e", "cash": "#f59e0b", "size": "#f59e0b", "quarantined": "#f59e0b",
+                    "pending": "#f59e0b", "stale": "#ef4444"}.get(why.code) %}
+<section class="card-2 mb-5 overflow-hidden">
+  <div class="px-4 py-3 border-b border-default flex items-center justify-between gap-3 flex-wrap">
+    <span class="text-sm font-semibold text-default">🤔 Why isn't it buying?</span>
+    {% if why.computed_at %}<span class="text-xs text-muted">checked {{ why.computed_at | ist }}</span>{% endif %}
+  </div>
+  <div class="px-4 py-3">
+    <p class="text-sm font-semibold {% if not why_color %}text-default{% endif %}"
+       {% if why_color %}style="color:{{ why_color }}"{% endif %}>{{ why.headline }}</p>
+    {% set d = why.d %}
+    {% if d %}
+    <dl class="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-xs">
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Regime</dt>
+        <dd class="text-default">{{ d.regime or "single-mode" }}{% if d.scan_times %} · scans {{ d.scan_times | join(", ") }}{% endif %}</dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Entries need</dt>
+        <dd class="text-default">{{ why.requirements | join(" · ") if why.requirements else "—" }}</dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Free cash</dt>
+        <dd class="text-default">
+          {% if d.free_cash is not none %}₹{{ "{:,.0f}".format(d.free_cash) }}{% else %}—{% endif %}
+          {% if d.position_size is not none %}<span class="text-muted"> vs ~₹{{ "{:,.0f}".format(d.position_size) }} per position</span>{% endif %}
+          {% if d.min_entry_cash is not none %}<span class="text-muted"> · floor ₹{{ "{:,.0f}".format(d.min_entry_cash) }}</span>{% endif %}
+        </dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Last bot buy</dt>
+        <dd class="text-default">{{ d.last_buy_date or "none yet" }}</dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Wanted {{ d.date }}</dt>
+        <dd class="text-default">
+          {% for w in d.wanted_today %}{{ w.symbol }} @ ₹{{ "{:,.2f}".format(w.price) }}{% if not loop.last %}, {% endif %}{% else %}<span class="text-muted">nothing</span>{% endfor %}
+          {% if d.bought_today %}<span class="text-muted"> · bought {{ d.bought_today | join(", ") }}</span>{% endif %}
+        </dd>
+      </div>
+      <div class="flex gap-2">
+        <dt class="text-muted w-28 shrink-0">Biggest fallers</dt>
+        <dd class="text-default">
+          {% for n in d.nearest %}{{ n.symbol }} {{ "{:+.1f}".format(n.change * 100) }}%{% if not loop.last %}, {% endif %}{% else %}<span class="text-muted">—</span>{% endfor %}
+          <span class="text-muted">(not held)</span>
+        </dd>
+      </div>
+      {% if d.quarantined %}
+      <div class="flex gap-2 sm:col-span-2">
+        <dt class="text-muted w-28 shrink-0">Benched</dt>
+        <dd class="text-default">{{ d.quarantined | join(", ") }} <span class="text-muted">— surveillance (AB4036), broker won't take bot orders</span></dd>
+      </div>
+      {% endif %}
+    </dl>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
 <!-- Runner status -->
 <div id="runner-status-bar" class="mb-4 flex items-center gap-3 text-xs text-muted">
   <span>Runner:</span>
@@ -393,7 +454,7 @@
           </td>
         </tr>
         {% else %}
-        <tr><td colspan="6" class="px-4 py-6 text-center text-muted text-xs">No shadow buy-points yet. While the bot is ON, the strategy runs each tick as if cash were unlimited and logs every entry it would take here — so a dry spell with no money still shows you what it wanted, and whether the price has since moved.</td></tr>
+        <tr><td colspan="6" class="px-4 py-6 text-center text-muted text-xs">No shadow buy-points yet. Every few minutes — bot ON or OFF — the strategy runs as if cash were unlimited and logs every entry it would take here — so a dry spell with no money still shows you what it wanted, and whether the price has since moved.</td></tr>
         {% endfor %}
       </tbody>
     </table>

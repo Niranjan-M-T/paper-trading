@@ -24,7 +24,8 @@ from src.engine.real_executor import (  # noqa: E402
     _logical_key_from_trade, cash_flow_residual, cumulative_split_factor, engine_symbol_root,
     intent_key, reconcile_kind, split_adjust_position, symbol_lag_days,
     build_shadow_cash, extract_shadow_buys, shadow_signal_key, shadow_buyable,
-    SHADOW_DAY_CASH,
+    SHADOW_DAY_CASH, effective_entry_params, estimate_position_size, entry_requirements,
+    entry_verdict,
 )
 
 
@@ -357,3 +358,149 @@ def test_suspend_stale_days_default_is_five():
     from src.core.config import settings
     # bumped 3→5 to cut edge-of-threshold noise from transient multi-day per-symbol data gaps
     assert settings.suspend_stale_days == 5
+
+
+# ---------- "why isn't it buying?" ----------
+
+def _s404_like():
+    """Duck-typed stand-in shaped like S404_s392_side_only's entry fields (no pandas in tests)."""
+    from types import SimpleNamespace as NS
+    mode = lambda **kw: NS(**{f: None for f in ("fall_threshold", "volume_spike_min", "macd_filter",
+                                                 "sma_above_prev", "allocation_pct",
+                                                 "max_new_buys_per_day")} | kw)
+    return NS(
+        fall_threshold=-0.030, volume_spike_min=1.1, macd_filter=None, sma_above_prev=None,
+        allocation_pct=0.16, max_new_buys_per_day=None,
+        mode_params_bull=mode(fall_threshold=-0.025, allocation_pct=0.18, macd_filter="__off__"),
+        mode_params_bear=mode(fall_threshold=-0.030, allocation_pct=0.14, volume_spike_min=1.2,
+                              macd_filter="positive", sma_above_prev=20),
+        mode_params_sideways=mode(fall_threshold=-0.025, allocation_pct=0.16, macd_filter="__off__",
+                                  sma_above_prev=-1),
+    )
+
+
+def test_effective_entry_params_swaps_by_regime_and_falls_back():
+    s = _s404_like()
+    bear = effective_entry_params(s, "bear")
+    assert bear["fall_threshold"] == -0.030 and bear["volume_spike_min"] == 1.2
+    assert bear["macd_filter"] == "positive" and bear["sma_above_prev"] == 20
+    assert bear["allocation_pct"] == 0.14
+    bull = effective_entry_params(s, "bull")
+    assert bull["fall_threshold"] == -0.025 and bull["volume_spike_min"] == 1.1  # None → base
+    assert bull["macd_filter"] is None                                           # "__off__" sentinel
+    assert effective_entry_params(s, "sideways")["sma_above_prev"] is None       # -1 sentinel
+    base = effective_entry_params(s, None)                                       # single-mode
+    assert base["fall_threshold"] == -0.030 and base["allocation_pct"] == 0.16
+    assert effective_entry_params(s, "weird")["fall_threshold"] == -0.030
+
+
+def test_estimate_position_size_by_mode():
+    assert estimate_position_size("pct_equity", 0.16, None, equity=20_000, cash=500) == 3_200
+    assert estimate_position_size("pct_cash", 0.5, None, equity=20_000, cash=1_000) == 500
+    assert estimate_position_size("fixed", None, 10_000, equity=0, cash=0) == 10_000
+    assert estimate_position_size("pct_equity", None, None, equity=1, cash=1) is None
+    assert estimate_position_size("pct_equity", 0.16, None, equity=-5, cash=0) == 0.0
+
+
+def test_entry_requirements_wording_for_bear():
+    reqs = entry_requirements(effective_entry_params(_s404_like(), "bear"))
+    assert reqs == ["≥3.0% drop", "≥1.2× usual volume", "MACD histogram > 0",
+                    "above its 20-day SMA yesterday"]
+    assert entry_requirements({}) == []
+
+
+def _diag(**kw):
+    d = {"date": "2026-09-25", "regime": "bear", "params": effective_entry_params(_s404_like(), "bear"),
+         "scan_times": ["11:00", "14:00"], "free_cash": 5_000.0, "position_size": 3_000.0,
+         "min_entry_cash": None, "wanted_today": [], "bought_today": [], "quarantined": [],
+         "nearest": [{"symbol": "ABC", "change": -0.021}], "today_bars": 900}
+    d.update(kw)
+    return d
+
+
+def _v(diag, *, on=True, now="15:00", weekday=True, today="2026-09-25"):
+    return entry_verdict(diag, bot_enabled=on, today_str=today, now_hhmm=now, is_weekday=weekday)
+
+
+def test_entry_verdict_precedence_top():
+    assert _v(None)[0] == "nodata"
+    assert _v(_diag(), on=False)[0] == "off"
+    both = _diag(bought_today=["XYZ"], wanted_today=[{"symbol": "XYZ", "price": 10.0}])
+    assert _v(both) == ("bought", "Bought today: XYZ.")
+
+
+def test_entry_verdict_wanted_but_not_bought_reasons():
+    w = [{"symbol": "AAA", "price": 100.0}]
+    assert _v(_diag(wanted_today=w, quarantined=["AAA"]))[0] == "quarantined"
+    code, head = _v(_diag(wanted_today=w, free_cash=900.0, min_entry_cash=1_000.0))
+    assert code == "cash" and "entry floor" in head
+    code, head = _v(_diag(wanted_today=w, free_cash=1_500.0, position_size=3_000.0))
+    assert code == "cash" and "below one position" in head
+    code, head = _v(_diag(wanted_today=[{"symbol": "MRF", "price": 130_000.0}]))
+    assert code == "size" and "MRF" in head
+    assert _v(_diag(wanted_today=w))[0] == "pending"
+    # wanted rows from a stale (yesterday) payload never count as today's
+    assert _v(_diag(date="2026-09-24", wanted_today=w), now="12:00")[0] == "stale"
+
+
+def test_entry_verdict_calendar_and_freshness():
+    assert _v(_diag(), weekday=False)[0] == "closed"
+    old = _diag(date="2026-09-24")
+    assert _v(old, now="09:30")[0] == "waiting"      # before 11:00+5 → just not updated yet
+    assert _v(old, now="11:05")[0] == "stale"        # past the first scan → trader is behind
+    assert _v(_diag(today_bars=0))[0] == "holiday"
+    assert _v(_diag(), now="10:59")[0] == "waiting"
+
+
+def test_entry_verdict_no_setup_explains_requirements():
+    code, head = _v(_diag(), now="12:00")
+    assert code == "no_setup"
+    assert "so far" in head and "(bear regime)" in head    # 14:00 scan still to come
+    assert "MACD histogram > 0" in head and "Closest: ABC -2.1%" in head
+    _, late = _v(_diag(), now="15:20")
+    assert "so far" not in late
+    _, bare = _v(_diag(regime=None, nearest=[]), now="15:20")
+    assert "regime" not in bare and "Closest" not in bare
+
+
+# ---------- daily digest ----------
+
+def _digest(**kw):
+    s = {"date_label": "Fri 25 Sep 2026", "market_data": True, "synced": True,
+         "last_sync": "25 Sep 15:29 IST", "cash": 1_200.0, "holdings_value": 20_000.0,
+         "pnl": metrics.split_pnl(21_200.0, 20_000.0, 700.0), "day_pnl": 312.0,
+         "day_since": "Thu 24 Sep", "fills": [], "bot_enabled": True,
+         "verdict": "No setups today (bear regime) — entries need ≥3.0% drop.", "wanted": []}
+    s.update(kw)
+    return s
+
+
+def test_daily_digest_holiday_beats_sync_and_nosync_warns():
+    # the trader still syncs the broker on a holiday, so no-candles must be checked first
+    assert "holiday" in whatsapp.format_daily_digest(_digest(market_data=False))
+    t = whatsapp.format_daily_digest(_digest(synced=False))
+    assert "didn't sync" in t and "25 Sep 15:29 IST" in t
+
+
+def test_daily_digest_full_body():
+    t = whatsapp.format_daily_digest(_digest(
+        fills=[{"side": "SELL", "symbol": "AAA", "qty": 3, "price": 105.5, "source": "bot"},
+               {"side": "BUY", "symbol": "BBB", "qty": 2, "price": 50.0, "source": "manual"}],
+        wanted=["CCC"]))
+    assert "Net worth ₹21,200" in t
+    assert "Since Thu 24 Sep +₹312" in t and "Total P&L +₹1,200 (+6.0%) on ₹20,000 invested" in t
+    assert "Realized +₹500" in t and "Unrealized +₹700" in t
+    assert "SELL 3 × AAA @ ₹105.50" in t and "BUY 2 × BBB @ ₹50.00 (manual)" in t
+    assert "Why no buys:" in t                      # a manual buy isn't the bot buying
+    assert "Strategy wanted today: CCC" in t
+    first = whatsapp.format_daily_digest(_digest(day_pnl=None))
+    assert "Since" not in first and "No trades today." in first
+    assert "-₹50" in whatsapp.format_daily_digest(_digest(day_pnl=-50.0))
+
+
+def test_daily_digest_why_line_only_when_on_and_no_bot_buy():
+    off = whatsapp.format_daily_digest(_digest(bot_enabled=False))
+    assert "Bot is OFF" in off and "Why no buys" not in off
+    bought = whatsapp.format_daily_digest(_digest(
+        fills=[{"side": "BUY", "symbol": "AAA", "qty": 1, "price": 10.0, "source": "bot"}]))
+    assert "Why no buys" not in bought

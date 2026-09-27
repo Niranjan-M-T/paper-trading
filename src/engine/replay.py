@@ -415,6 +415,18 @@ async def _load_overrides(portfolio_id: int) -> dict:
     return val if isinstance(val, dict) else {}
 
 
+async def load_effective_strategy(portfolio: PortfolioRow, strategy: StrategyV2) -> StrategyV2 | None:
+    """The strategy exactly as replay_one_portfolio runs it: the portfolio's dashboard overrides
+    applied and its capital bound (mirrors the override/bind block inside replay_one_portfolio).
+    None when the overrides fail validation — replay skips the portfolio in that case too. Used by
+    read-only diagnostics that must report the parameters the engine is actually using."""
+    overrides = await _load_overrides(portfolio.id)
+    overridden, errs = coerce_and_apply(strategy, overrides)
+    if errs:
+        return None
+    return replace(overridden, starting_cash=float(portfolio.capital))
+
+
 async def replay_one_portfolio(
     portfolio: PortfolioRow,
     strategy: StrategyV2,
