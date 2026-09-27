@@ -186,47 +186,65 @@ def _signed_rupees(v: float) -> str:
     return f"{'+' if v >= 0 else '-'}₹{abs(float(v)):,.0f}"
 
 
-def format_daily_digest(s: dict) -> str:
-    """Build the end-of-day WhatsApp digest for the live account (tools/daily_digest.py). Pure.
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
 
-    `s` keys: date_label; market_data (any candle today — False ⇒ exchange holiday, checked FIRST
-    because the trader still syncs the broker on a holiday); synced (a broker funds sync today);
-    last_sync; cash, holdings_value, pnl (metrics.split_pnl dict); day_pnl + day_since (change in
-    deposit-adjusted total P&L since the previous synced digest, or None on the first one); fills
-    [{side, symbol, qty, price, source: "bot"|"manual"}]; bot_enabled; verdict (entry_verdict
-    headline, or None); wanted (shadow symbols today). The "why no buys" line only shows when the
-    bot is ON and bought nothing — when it's OFF, that IS the reason."""
-    head = f"📊 Daily digest · {s['date_label']}"
-    if not s.get("market_data"):
-        return f"{head}\nNo market data today — exchange holiday? (If not, the data poller is down.)"
-    if not s.get("synced"):
-        return (f"{head}\n⚠️ The trader didn't sync with the broker today (last sync: "
-                f"{s.get('last_sync') or 'never'}) — check that paperaglo-real-trader is running.")
+
+DIGEST_MAX_FILL_LINES = 20
+
+
+def format_weekly_digest(s: dict) -> str:
+    """Build the weekly WhatsApp digest for the live account (tools/weekly_digest.py). Pure.
+
+    `s` keys: week_label; last_sync; sync_warning (or None); cash, holdings_value, pnl
+    (metrics.split_pnl dict); week_pnl + week_since (change in deposit-adjusted total P&L since the
+    previous weekly digest, or None on the first one); deposits_week (net recorded deposits this
+    week — they move invested, not P&L); fills [{day, side, symbol, qty, price, source:
+    "bot"|"manual"}] in time order; bot_enabled; verdict (entry_verdict headline, or None); wanted
+    (shadow symbols this week). The "why no bot buys" line shows only when the bot is ON and made no
+    BUY all week — when it's OFF, that IS the reason. Fill lines cap at DIGEST_MAX_FILL_LINES."""
     p = s["pnl"]
-    lines = [head,
+    lines = [f"📊 Weekly digest · {s['week_label']}",
              f"Net worth ₹{p['net_worth']:,.0f}  (cash ₹{s['cash']:,.0f} + holdings "
              f"₹{s['holdings_value']:,.0f})"]
-    day = s.get("day_pnl")
-    day_txt = f"Since {s.get('day_since') or 'last digest'} {_signed_rupees(day)}  ·  " if day is not None else ""
+    wk = s.get("week_pnl")
+    wk_txt = (f"This week {_signed_rupees(wk)} (since {s.get('week_since') or 'last digest'})  ·  "
+              if wk is not None else "")
     pct = f" ({p['pct']:+.1f}%)" if p.get("pct") is not None else ""
-    lines.append(f"{day_txt}Total P&L {_signed_rupees(p['total_pnl'])}{pct} on ₹{p['invested']:,.0f} invested")
+    lines.append(f"{wk_txt}Total P&L {_signed_rupees(p['total_pnl'])}{pct} on ₹{p['invested']:,.0f} invested")
     lines.append(f"Realized {_signed_rupees(p['realized_pnl'])}  ·  Unrealized {_signed_rupees(p['unrealized_pnl'])}")
+    dep = float(s.get("deposits_week") or 0.0)
+    if abs(dep) >= 0.5:
+        lines.append(f"{'Deposits' if dep > 0 else 'Withdrawals'} this week: {_signed_rupees(dep)} "
+                     f"(capital, not P&L)")
     fills = s.get("fills") or []
     if fills:
-        lines.append("Trades today:")
-        for f in fills:
+        buys = [f for f in fills if f["side"] == "BUY"]
+        sells = [f for f in fills if f["side"] != "BUY"]
+
+        def notional(fs: list[dict]) -> float:
+            return sum(int(f["qty"]) * float(f["price"]) for f in fs)
+
+        lines.append(f"Trades this week: {_plural(len(buys), 'buy')} (₹{notional(buys):,.0f})  ·  "
+                     f"{_plural(len(sells), 'sell')} (₹{notional(sells):,.0f})")
+        for f in fills[:DIGEST_MAX_FILL_LINES]:
             dot = "\U0001F7E2" if f["side"] == "BUY" else "\U0001F534"  # 🟢 / 🔴
             who = "" if f["source"] == "bot" else " (manual)"
-            lines.append(f"  {dot} {f['side']} {int(f['qty'])} × {f['symbol']} @ ₹{float(f['price']):,.2f}{who}")
+            lines.append(f"  {dot} {f['day']} {f['side']} {int(f['qty'])} × {f['symbol']} "
+                         f"@ ₹{float(f['price']):,.2f}{who}")
+        if len(fills) > DIGEST_MAX_FILL_LINES:
+            lines.append(f"  …and {len(fills) - DIGEST_MAX_FILL_LINES} more (see /bot)")
     else:
-        lines.append("No trades today.")
+        lines.append("No trades this week.")
     if not s.get("bot_enabled"):
-        lines.append("⏸ Bot is OFF — no orders were placed.")
+        lines.append("⏸ Bot is currently OFF — it won't place orders until you switch it on.")
     elif s.get("verdict") and not any(f["side"] == "BUY" and f["source"] == "bot" for f in fills):
-        lines.append(f"Why no buys: {s['verdict']}")
+        lines.append(f"Why no bot buys: {s['verdict']}")
     wanted = s.get("wanted") or []
     if wanted:
-        lines.append(f"🔭 Strategy wanted today: {', '.join(wanted)}")
-    if s.get("last_sync"):
+        lines.append(f"🔭 Strategy wanted this week: {', '.join(wanted)}")
+    if s.get("sync_warning"):
+        lines.append(f"⚠️ {s['sync_warning']}")
+    elif s.get("last_sync"):
         lines.append(f"as of {s['last_sync']}")
     return "\n".join(lines)

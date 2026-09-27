@@ -331,6 +331,22 @@ Tests: 51/51 (+ a template render check and the real `_nearest_misses` source ex
 Deploy: `sql/017` **before** restarting `paperaglo-real-trader` + `paperaglo-web`, then start the
 digest app and `pm2 save`.
 
+## 2026-09-27 — digest switched from daily to weekly
+
+Owner preferred a weekly summary of trades + P/L over a daily message. The daily digest is
+**replaced** (not kept alongside): `tools/weekly_digest.py`, PM2 `paperaglo-weekly-digest`, **Fridays
+15:35 IST** (`35 15 * * 5`), `whatsapp.format_weekly_digest`. Covers the ISO week (Mon–Sun IST): net
+worth, the week's P&L (difference of two weekly total-P&L snapshots — send-once key
+`digest:week:<%G-W%V>`, zero-padded so string order is time order), total P&L %, realized/unrealized,
+deposits/withdrawals recorded this week (called out as capital, not P&L), every fill with its weekday
+and bot/manual tag plus buy/sell totals (capped at 20 lines), the "why no bot buys" line if the bot is
+ON and made no BUY all week — judged as of the diagnostics' own trading day, so an evening/weekend send
+still gets a real answer — and the week's shadow wants. The per-day holiday/no-sync branches are gone;
+instead a warning line if the last broker sync is older than the last weekday. Send window:
+Friday ≥15:30 → Sunday (a weekend resurrect is fine, send-once dedups; a Mon–Thu start would otherwise
+send an empty week). Tests 53/53. Deploy: `pm2 delete paperaglo-daily-digest` if it was started, then
+`pm2 start ecosystem.config.js --only paperaglo-weekly-digest` + `pm2 save`.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

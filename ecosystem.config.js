@@ -91,18 +91,18 @@ module.exports = {
       merge_logs: true,
     },
     {
-      // End-of-day WhatsApp digest for the live account (P&L, fills, why-no-buys, shadow wants).
-      // Weekdays 15:35 IST, just after the close. Sends once per day (real_signals digest:<date>);
-      // the script itself skips runs outside weekdays-after-15:30, because PM2 also fires a
-      // cron_restart app on every start/restart/resurrect.
-      name: "paperaglo-daily-digest",
+      // Weekly WhatsApp digest for the live account (week's P&L, every fill, why-no-buys, shadow
+      // wants). Fridays 15:35 IST, just after the close. Sends once per ISO week (real_signals
+      // digest:week:<%G-W%V>); the script itself skips runs outside Friday-after-15:30 → Sunday,
+      // because PM2 also fires a cron_restart app on every start/restart/resurrect.
+      name: "paperaglo-weekly-digest",
       script: "python",
-      args: "-m tools.daily_digest",
+      args: "-m tools.weekly_digest",
       cwd: __dirname,
       autorestart: false,
-      cron_restart: "35 15 * * 1-5",
-      out_file: "logs/pm2/daily_digest.out.log",
-      error_file: "logs/pm2/daily_digest.err.log",
+      cron_restart: "35 15 * * 5",
+      out_file: "logs/pm2/weekly_digest.out.log",
+      error_file: "logs/pm2/weekly_digest.err.log",
       merge_logs: true,
     },
     {

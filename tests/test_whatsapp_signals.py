@@ -463,44 +463,77 @@ def test_entry_verdict_no_setup_explains_requirements():
     assert "regime" not in bare and "Closest" not in bare
 
 
-# ---------- daily digest ----------
+# ---------- weekly digest ----------
 
 def _digest(**kw):
-    s = {"date_label": "Fri 25 Sep 2026", "market_data": True, "synced": True,
-         "last_sync": "25 Sep 15:29 IST", "cash": 1_200.0, "holdings_value": 20_000.0,
-         "pnl": metrics.split_pnl(21_200.0, 20_000.0, 700.0), "day_pnl": 312.0,
-         "day_since": "Thu 24 Sep", "fills": [], "bot_enabled": True,
+    s = {"week_label": "21 Sep – 25 Sep 2026", "last_sync": "Fri 25 Sep 15:29 IST", "sync_warning": None,
+         "cash": 1_200.0, "holdings_value": 20_000.0,
+         "pnl": metrics.split_pnl(21_200.0, 20_000.0, 700.0), "week_pnl": 312.0,
+         "week_since": "Fri 18 Sep", "deposits_week": 0.0, "fills": [], "bot_enabled": True,
          "verdict": "No setups today (bear regime) — entries need ≥3.0% drop.", "wanted": []}
     s.update(kw)
     return s
 
 
-def test_daily_digest_holiday_beats_sync_and_nosync_warns():
-    # the trader still syncs the broker on a holiday, so no-candles must be checked first
-    assert "holiday" in whatsapp.format_daily_digest(_digest(market_data=False))
-    t = whatsapp.format_daily_digest(_digest(synced=False))
-    assert "didn't sync" in t and "25 Sep 15:29 IST" in t
+def _fill(side, sym, qty, price, source="bot", day="Mon"):
+    return {"day": day, "side": side, "symbol": sym, "qty": qty, "price": price, "source": source}
 
 
-def test_daily_digest_full_body():
-    t = whatsapp.format_daily_digest(_digest(
-        fills=[{"side": "SELL", "symbol": "AAA", "qty": 3, "price": 105.5, "source": "bot"},
-               {"side": "BUY", "symbol": "BBB", "qty": 2, "price": 50.0, "source": "manual"}],
-        wanted=["CCC"]))
+def test_weekly_digest_full_body():
+    t = whatsapp.format_weekly_digest(_digest(
+        fills=[_fill("SELL", "AAA", 3, 105.5, day="Tue"), _fill("BUY", "BBB", 2, 50.0, "manual", "Wed")],
+        wanted=["CCC", "DDD"], deposits_week=10_000.0))
+    assert t.startswith("📊 Weekly digest · 21 Sep – 25 Sep 2026")
     assert "Net worth ₹21,200" in t
-    assert "Since Thu 24 Sep +₹312" in t and "Total P&L +₹1,200 (+6.0%) on ₹20,000 invested" in t
+    assert "This week +₹312 (since Fri 18 Sep)" in t
+    assert "Total P&L +₹1,200 (+6.0%) on ₹20,000 invested" in t
     assert "Realized +₹500" in t and "Unrealized +₹700" in t
-    assert "SELL 3 × AAA @ ₹105.50" in t and "BUY 2 × BBB @ ₹50.00 (manual)" in t
-    assert "Why no buys:" in t                      # a manual buy isn't the bot buying
-    assert "Strategy wanted today: CCC" in t
-    first = whatsapp.format_daily_digest(_digest(day_pnl=None))
-    assert "Since" not in first and "No trades today." in first
-    assert "-₹50" in whatsapp.format_daily_digest(_digest(day_pnl=-50.0))
+    assert "Deposits this week: +₹10,000 (capital, not P&L)" in t
+    assert "Trades this week: 1 buy (₹100)  ·  1 sell (₹316)" in t
+    assert "Tue SELL 3 × AAA @ ₹105.50" in t and "Wed BUY 2 × BBB @ ₹50.00 (manual)" in t
+    assert "Why no bot buys:" in t                    # a manual buy isn't the bot buying
+    assert "Strategy wanted this week: CCC, DDD" in t
+    assert t.endswith("as of Fri 25 Sep 15:29 IST")
 
 
-def test_daily_digest_why_line_only_when_on_and_no_bot_buy():
-    off = whatsapp.format_daily_digest(_digest(bot_enabled=False))
-    assert "Bot is OFF" in off and "Why no buys" not in off
-    bought = whatsapp.format_daily_digest(_digest(
-        fills=[{"side": "BUY", "symbol": "AAA", "qty": 1, "price": 10.0, "source": "bot"}]))
-    assert "Why no buys" not in bought
+def test_weekly_digest_first_week_empty_week_and_withdrawal():
+    t = whatsapp.format_weekly_digest(_digest(week_pnl=None, deposits_week=-2_000.0))
+    assert "This week" not in t and "No trades this week." in t
+    assert "Withdrawals this week: -₹2,000" in t
+    assert "Deposits" not in whatsapp.format_weekly_digest(_digest())   # zero → no line
+    assert "This week -₹50" in whatsapp.format_weekly_digest(_digest(week_pnl=-50.0))
+
+
+def test_weekly_digest_why_line_only_when_on_and_no_bot_buy():
+    off = whatsapp.format_weekly_digest(_digest(bot_enabled=False))
+    assert "Bot is currently OFF" in off and "Why no bot buys" not in off
+    bought = whatsapp.format_weekly_digest(_digest(fills=[_fill("BUY", "AAA", 1, 10.0)]))
+    assert "Why no bot buys" not in bought
+    only_sells = whatsapp.format_weekly_digest(_digest(fills=[_fill("SELL", "AAA", 1, 10.0)]))
+    assert "Why no bot buys" in only_sells
+
+
+def test_weekly_digest_caps_fill_lines_and_warns_on_stale_sync():
+    many = [_fill("BUY", f"S{i}", 1, 10.0) for i in range(whatsapp.DIGEST_MAX_FILL_LINES + 3)]
+    t = whatsapp.format_weekly_digest(_digest(fills=many))
+    assert "…and 3 more (see /bot)" in t and "S22" not in t
+    assert "23 buys" in t
+    w = whatsapp.format_weekly_digest(_digest(sync_warning="No broker sync this week"))
+    assert "⚠️ No broker sync this week" in w and "as of" not in w
+
+
+def test_weekly_digest_send_window_and_keys():
+    from tools.weekly_digest import _last_weekday, in_send_window, week_key
+    ist = timezone(timedelta(hours=5, minutes=30))
+    at = lambda d, hh, mm: datetime(2026, 9, d, hh, mm, tzinfo=ist)  # noqa: E731 — Sep 2026: 21=Mon … 27=Sun
+    assert not in_send_window(at(24, 18, 0))     # Thursday evening — a deploy must not send
+    assert not in_send_window(at(25, 15, 29))    # Friday, market still open
+    assert in_send_window(at(25, 15, 35))        # the cron slot
+    assert in_send_window(at(26, 10, 0)) and in_send_window(at(27, 23, 0))  # weekend resurrect
+    assert not in_send_window(at(28, 9, 0))      # Monday = a new, empty week
+    # one key per ISO week, zero-padded so string order == time order
+    assert week_key(at(21, 9, 0)) == week_key(at(27, 23, 0)) == "digest:week:2026-W39"
+    assert week_key(datetime(2026, 1, 1, tzinfo=ist)) == "digest:week:2026-W01"
+    assert "digest:week:2026-W09" < "digest:week:2026-W10"
+    assert _last_weekday(date(2026, 9, 27)) == date(2026, 9, 25)   # Sun → Fri
+    assert _last_weekday(date(2026, 9, 23)) == date(2026, 9, 23)   # Wed → itself
