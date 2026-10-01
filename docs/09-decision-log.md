@@ -362,6 +362,19 @@ by calling the real `bot_page` against a stubbed DB raising the production error
 **Deploy lesson:** on the VPS run `source .venv/bin/activate` first (there is no bare `python`), and
 apply every new `sql/` file before restarting.
 
+## 2026-10-01 — XIRR on /bot and in the weekly digest
+
+The account is SIP-funded, so `est_apy_pct` (CAGR of net ÷ invested since start) is misleading: it
+treats every deposit as if it were invested on day one, so each top-up drags the rate down. Added
+money-weighted **XIRR**: `metrics.xirr` (pure bisection — NPV is monotone for outflows-then-terminal,
+so it can't diverge the way Newton can; no scipy) and `metrics.live_account_xirr` (opening capital
+`REAL_OPENING_CAPITAL` at the live portfolio's `started_at`, each `real_deposits` row at its `ts`, a
+negative amount = withdrawal = money back out, terminal = net worth now; None for the first 7 days, the
+same warm-up as APY). Exposed as `xirr_pct` on `/api/bot/stats`, a "XIRR (SIP-aware)" tile on `/bot`,
+and a line in the weekly digest. Example: ₹18k + a ₹10k SIP 60 days ago, now ₹29,690 → Est. APY 11.3%
+vs XIRR 15.2%. Accuracy depends on deposits being recorded with their real dates (the /bot form's date
+field). Tests 59/59.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

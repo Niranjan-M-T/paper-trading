@@ -71,3 +71,53 @@ def estimated_apy(equity: float, capital: float, started_at: datetime | None) ->
     growth = equity / capital
     cagr = growth ** (365.0 / days_live) - 1.0
     return cagr * 100.0
+
+
+def xirr(flows: list[tuple[datetime, float]]) -> float | None:
+    """Annualised money-weighted return (XIRR) as a percent, or None. Pure.
+
+    `flows` are (when, amount) from the INVESTOR's side: money put in is negative, money taken
+    out (withdrawals, and the terminal value) positive. Solves Σ amount / (1+r)^(years since the
+    first flow) = 0 by bisection — for the usual shape (outflows, then a positive terminal value)
+    NPV falls monotonically in r, so bisection always converges where Newton can overshoot. None
+    when there's nothing to solve: no outflow or no inflow, or no sign change on the bracket."""
+    if not flows or not any(a < 0 for _, a in flows) or not any(a > 0 for _, a in flows):
+        return None
+    t0 = min(t for t, _ in flows)
+    pts = [((t - t0).total_seconds() / (365.0 * 86400.0), float(a)) for t, a in flows]
+
+    def npv(r: float) -> float:
+        return sum(a / (1.0 + r) ** y for y, a in pts)
+
+    lo, hi = -0.9999, 1.0
+    while npv(hi) > 0 and hi < 1e6:  # widen until the root is bracketed
+        hi *= 2.0
+    if npv(lo) * npv(hi) > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        if npv(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-10:
+            break
+    return (lo + hi) / 2.0 * 100.0
+
+
+def live_account_xirr(started_at: datetime | None, opening_capital: float,
+                      deposits: list[tuple[datetime, float]], net_worth: float,
+                      at: datetime | None = None) -> float | None:
+    """XIRR (percent/yr) of the live SIP account: the opening capital goes in at `started_at`,
+    each recorded deposit at its timestamp (a negative amount = withdrawal = money back out), and
+    today's net worth comes out at `at`. Unlike estimated_apy — which treats every rupee as if it
+    were invested on day one, so a fresh SIP drags the rate down — this weights each deposit by how
+    long it has actually been working. None for the first MIN_DAYS_LIVE days (annualising a few
+    days is noise, same rule as estimated_apy) or when there's no value to measure."""
+    at = at or now_ist()
+    if not started_at or net_worth <= 0 or (at - started_at).total_seconds() / 86400.0 < MIN_DAYS_LIVE:
+        return None
+    flows = [(started_at, -float(opening_capital))]
+    flows += [(ts, -float(amt)) for ts, amt in deposits if amt]
+    flows.append((at, float(net_worth)))
+    return xirr(flows)

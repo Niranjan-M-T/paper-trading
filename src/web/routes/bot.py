@@ -29,7 +29,7 @@ from src.core.config import settings
 from src.core.db import execute, fetch, fetchrow
 from src.engine.real_executor import entry_requirements, entry_verdict, shadow_buyable
 from src.core.logtail import read_log_tail
-from src.core.metrics import days_live, estimated_apy, split_pnl
+from src.core.metrics import days_live, estimated_apy, live_account_xirr, split_pnl
 from src.core.time import IST, is_market_open, now_ist
 from src.web.auth import require_admin
 
@@ -491,7 +491,8 @@ async def api_bot_stats() -> JSONResponse:
         "SELECT COALESCE(SUM(qty * COALESCE(ltp, avg_price)), 0)::float8 AS v, "
         "COALESCE(SUM(pnl), 0)::float8 AS pnl FROM real_holdings"
     )
-    dep = await fetchrow("SELECT COALESCE(SUM(amount), 0)::float8 AS total FROM real_deposits")
+    dep_rows = await fetch("SELECT ts, amount::float8 AS amount FROM real_deposits ORDER BY ts")
+    dep = {"total": sum(float(r["amount"]) for r in dep_rows)}
 
     cash = float(funds["cash"]) if funds and funds["cash"] is not None else 0.0
     holdings_value = float(hv["v"]) if hv else 0.0
@@ -518,6 +519,9 @@ async def api_bot_stats() -> JSONResponse:
         "unrealized_pnl": stats["unrealized_pnl"],
         "pct": stats["pct"],
         "est_apy_pct": estimated_apy(net_worth, invested, pf["started_at"]),
+        # Money-weighted: each SIP deposit counts only from the day it landed.
+        "xirr_pct": live_account_xirr(pf["started_at"], settings.real_opening_capital,
+                                      [(r["ts"], float(r["amount"])) for r in dep_rows], net_worth),
     })
 
 

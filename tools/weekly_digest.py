@@ -31,7 +31,7 @@ from datetime import date, datetime, time, timedelta
 from src.core import whatsapp
 from src.core.config import settings
 from src.core.db import close_pool, execute, fetch, fetchrow
-from src.core.metrics import split_pnl
+from src.core.metrics import live_account_xirr, split_pnl
 from src.core.time import IST, MARKET_CLOSE, now_ist
 from src.engine.real_executor import entry_verdict
 
@@ -80,13 +80,18 @@ async def build_digest(now: datetime) -> tuple[dict, float]:
     hv = await fetchrow(
         "SELECT COALESCE(SUM(qty * COALESCE(ltp, avg_price)), 0)::float8 AS v, "
         "COALESCE(SUM(pnl), 0)::float8 AS pnl FROM real_holdings")
-    dep = await fetchrow("SELECT COALESCE(SUM(amount), 0)::float8 AS total FROM real_deposits")
+    dep_rows = await fetch("SELECT ts, amount::float8 AS amount FROM real_deposits ORDER BY ts")
     cash = float(funds["cash"]) if funds and funds["cash"] is not None else 0.0
     holdings_value = float(hv["v"]) if hv else 0.0
     unrealized = float(hv["pnl"]) if hv else 0.0
-    invested = settings.real_opening_capital + (float(dep["total"]) if dep and dep["total"] else 0.0)
+    invested = settings.real_opening_capital + sum(float(r["amount"]) for r in dep_rows)
     pnl = split_pnl(cash + holdings_value, invested, unrealized)
     s.update(cash=cash, holdings_value=holdings_value, pnl=pnl)
+    # Same money-weighted XIRR as /api/bot/stats (opening capital at the live portfolio's start).
+    live = await fetchrow("SELECT started_at FROM portfolios WHERE live = TRUE ORDER BY id LIMIT 1")
+    s["xirr_pct"] = live_account_xirr(
+        live["started_at"] if live else None, settings.real_opening_capital,
+        [(r["ts"], float(r["amount"])) for r in dep_rows], pnl["net_worth"], at=now)
 
     # Week P&L = change in the deposit-adjusted total since the previous weekly snapshot (a deposit
     # moves net worth and invested equally, so it cancels instead of showing up as profit).

@@ -201,7 +201,7 @@ def format_weekly_digest(s: dict) -> str:
     previous weekly digest, or None on the first one); deposits_week (net recorded deposits this
     week — they move invested, not P&L); fills [{day, side, symbol, qty, price, source:
     "bot"|"manual"}] in time order; bot_enabled; verdict (entry_verdict headline, or None); wanted
-    (shadow symbols this week). The "why no bot buys" line shows only when the bot is ON and made no
+    (shadow symbols this week); xirr_pct (metrics.live_account_xirr, or None). The "why no bot buys" line shows only when the bot is ON and made no
     BUY all week — when it's OFF, that IS the reason. Fill lines cap at DIGEST_MAX_FILL_LINES."""
     p = s["pnl"]
     lines = [f"📊 Weekly digest · {s['week_label']}",
@@ -212,7 +212,9 @@ def format_weekly_digest(s: dict) -> str:
               if wk is not None else "")
     pct = f" ({p['pct']:+.1f}%)" if p.get("pct") is not None else ""
     lines.append(f"{wk_txt}Total P&L {_signed_rupees(p['total_pnl'])}{pct} on ₹{p['invested']:,.0f} invested")
-    lines.append(f"Realized {_signed_rupees(p['realized_pnl'])}  ·  Unrealized {_signed_rupees(p['unrealized_pnl'])}")
+    xirr = s.get("xirr_pct")
+    xirr_txt = f"  ·  XIRR {xirr:+.1f}%/yr" if xirr is not None else ""
+    lines.append(f"Realized {_signed_rupees(p['realized_pnl'])}  ·  Unrealized {_signed_rupees(p['unrealized_pnl'])}{xirr_txt}")
     dep = float(s.get("deposits_week") or 0.0)
     if abs(dep) >= 0.5:
         lines.append(f"{'Deposits' if dep > 0 else 'Withdrawals'} this week: {_signed_rupees(dep)} "

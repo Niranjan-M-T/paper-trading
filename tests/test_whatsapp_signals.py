@@ -537,3 +537,54 @@ def test_weekly_digest_send_window_and_keys():
     assert "digest:week:2026-W09" < "digest:week:2026-W10"
     assert _last_weekday(date(2026, 9, 27)) == date(2026, 9, 25)   # Sun → Fri
     assert _last_weekday(date(2026, 9, 23)) == date(2026, 9, 23)   # Wed → itself
+
+
+# ---------- XIRR (SIP-aware return) ----------
+
+def _d(y, m, dd):
+    return datetime(y, m, dd, tzinfo=timezone.utc)
+
+
+def test_xirr_exact_one_year_and_loss():
+    assert abs(metrics.xirr([(_d(2025, 1, 1), -1000.0), (_d(2026, 1, 1), 1100.0)]) - 10.0) < 1e-6
+    assert abs(metrics.xirr([(_d(2025, 1, 1), -1000.0), (_d(2026, 1, 1), 800.0)]) - (-20.0)) < 1e-6
+
+
+def test_xirr_root_zeroes_npv_for_multi_deposit_flows():
+    flows = [(_d(2026, 1, 1), -10_000.0), (_d(2026, 4, 1), -5_000.0), (_d(2026, 7, 1), 1_000.0),
+             (_d(2026, 12, 31), 16_500.0)]
+    r = metrics.xirr(flows) / 100.0
+    npv = sum(a / (1 + r) ** ((t - flows[0][0]).days / 365.0) for t, a in flows)
+    assert abs(npv) < 1e-4
+
+
+def test_xirr_unsolvable_returns_none():
+    assert metrics.xirr([]) is None
+    assert metrics.xirr([(_d(2026, 1, 1), -1000.0)]) is None            # no terminal value
+    assert metrics.xirr([(_d(2026, 1, 1), 1000.0), (_d(2026, 6, 1), 5.0)]) is None   # no outflow
+
+
+def test_live_account_xirr_is_sip_aware():
+    start, now = _d(2025, 10, 1), _d(2026, 10, 1)
+    # ₹18k for a full year → ₹19.8k: 10%/yr.
+    base = metrics.live_account_xirr(start, 18_000, [], 19_800, at=now)
+    assert abs(base - 10.0) < 1e-6
+    # A ₹10k SIP landing the day before measurement adds ~nothing of time — XIRR stays ~10%,
+    # where a day-one CAGR on (net / invested) would collapse toward 0%.
+    sip = metrics.live_account_xirr(start, 18_000, [(_d(2026, 9, 30), 10_000)], 29_800, at=now)
+    assert abs(sip - 10.0) < 0.5
+    # A withdrawal (negative deposit) is money handed back, not a loss.
+    wd = metrics.live_account_xirr(start, 18_000, [(_d(2026, 4, 1), -5_000)], 14_800, at=now)
+    assert wd is not None and wd > 0
+
+
+def test_live_account_xirr_warmup_and_bad_inputs():
+    now = _d(2026, 10, 1)
+    assert metrics.live_account_xirr(_d(2026, 9, 28), 18_000, [], 18_500, at=now) is None  # < 7 days
+    assert metrics.live_account_xirr(None, 18_000, [], 18_500, at=now) is None
+    assert metrics.live_account_xirr(_d(2025, 1, 1), 18_000, [], 0.0, at=now) is None
+
+
+def test_weekly_digest_shows_xirr_when_present():
+    assert "XIRR +12.3%/yr" in whatsapp.format_weekly_digest(_digest(xirr_pct=12.34))
+    assert "XIRR" not in whatsapp.format_weekly_digest(_digest())

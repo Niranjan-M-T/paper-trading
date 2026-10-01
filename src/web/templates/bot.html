@@ -165,7 +165,7 @@
     <span class="text-sm font-semibold text-default">Performance <span class="text-muted font-normal">(live account)</span></span>
     <span id="perf-updated" class="text-xs text-muted"></span>
   </div>
-  <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 p-4 text-sm">
+  <div class="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 p-4 text-sm">
     <div>
       <div class="text-xs text-muted mb-1">Total P&amp;L</div>
       <div class="font-mono font-semibold" id="perf-total">—</div>
@@ -186,6 +186,10 @@
     <div title="Compound annual growth rate extrapolated from the return so far.">
       <div class="text-xs text-muted mb-1">Est. APY</div>
       <div class="font-mono" id="perf-apy">—</div>
+    </div>
+    <div title="Money-weighted annual return: each SIP deposit counts only from the day it landed, so fresh top-ups don't drag the rate down. Shows — for the first 7 days.">
+      <div class="text-xs text-muted mb-1">XIRR <span class="font-normal">(SIP-aware)</span></div>
+      <div class="font-mono font-semibold" id="perf-xirr">—</div>
     </div>
     <div>
       <div class="text-xs text-muted mb-1">Days running</div>
@@ -855,6 +859,7 @@
       T("perf-unrealized", signMoney(d.unrealized_pnl)); color("perf-unrealized", d.unrealized_pnl);
       T("perf-invested", d.invested == null ? "—" : money(d.invested));
       T("perf-apy", pctTxt(d.est_apy_pct));              color("perf-apy", d.est_apy_pct);
+      T("perf-xirr", pctTxt(d.xirr_pct));                color("perf-xirr", d.xirr_pct);
       T("perf-days", (d.days_running ?? 0) + "d");
       T("perf-updated", d.portfolio.strategy_id + (d.started_at ? " · since " + d.started_at.slice(0, 10) : ""));
     } catch (_) {}
