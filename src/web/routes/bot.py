@@ -18,6 +18,7 @@ JSON polling endpoints:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -48,6 +49,31 @@ def _iso(dt: datetime | None) -> str | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(IST).isoformat()
+
+
+log = logging.getLogger("web.bot")
+
+# Every key the why-not-buying card reads (real_trader.write_entry_diagnostics writes them all).
+# Filling them in the route means an older/partial payload renders as "—" instead of crashing the
+# template — a render error happens outside the route's guards and would 500 the whole page.
+_DIAG_DEFAULTS = {
+    "date": None, "regime": None, "params": {}, "scan_times": [], "free_cash": None,
+    "position_size": None, "min_entry_cash": None, "wanted_today": [], "bought_today": [],
+    "quarantined": [], "last_buy_date": None, "nearest": [], "today_bars": 0,
+}
+
+
+async def _optional_fetch(degraded: list[str], label: str, query: str, *args) -> list:
+    """fetch() for an OPTIONAL /bot section — on failure log it, note it for the page banner and
+    return no rows. /bot hosts the master kill switch, so a missing migration for an informational
+    card (e.g. sql/015 never applied → 'relation "cash_reconcile" does not exist') must degrade
+    that card, never 500 the page you'd use to stop the bot."""
+    try:
+        return await fetch(query, *args)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("/bot optional section failed", extra={"section": label})
+        degraded.append(f"{label}: {exc}")
+        return []
 
 
 def _flt(v, default=None):
@@ -90,14 +116,17 @@ async def bot_page(request: Request) -> HTMLResponse:
         "FROM real_deposits ORDER BY ts DESC"
     )
     total_deposited = sum(float(r["amount"]) for r in deposits)
-    pending_reconcile = await fetch(
+    degraded: list[str] = []  # optional sections that failed → banner on the page
+    pending_reconcile = await _optional_fetch(
+        degraded, "cash reconcile (sql/015)",
         "SELECT id, detected_at, amount::float8 AS amount, direction "
         "FROM cash_reconcile WHERE status = 'pending' ORDER BY detected_at DESC"
     )
 
     # Shadow buy-points: entries the strategy WANTED while cash-gated, joined against live
     # candles so you can see, per name, whether it's still catchable at that price or lower.
-    shadow_rows = await fetch(
+    shadow_rows = await _optional_fetch(
+        degraded, "shadow buy-points (sql/016)",
         """
         SELECT s.symbol, s.signal_date, s.signal_time, s.price::float8 AS price, s.reason,
                lo.low_since::float8 AS low_since, lp.last_price::float8 AS last_price
@@ -135,35 +164,37 @@ async def bot_page(request: Request) -> HTMLResponse:
         })
 
     # "Why isn't it buying?" — the trader persists the evidence every shadow pass; the verdict adds
-    # the render-time facts (switch, clock). Guarded on its own: this page hosts the master switch,
-    # so a missing entry_diagnostics table (sql/017 not applied yet) must never 500 it.
+    # the render-time facts (switch, clock). Optional like the cards above: a missing table
+    # (sql/017) or an unexpected payload degrades the panel, never the page.
     bot_enabled = bool(bot["enabled"]) if bot else False
     why = None
     if live_pf:
-        diag, diag_at, diag_error = None, None, False
         try:
-            drow = await fetchrow(
+            drows = await _optional_fetch(
+                degraded, "why-not-buying panel (sql/017)",
                 "SELECT computed_at, payload FROM entry_diagnostics WHERE portfolio_id = $1", live_pf["id"])
-        except Exception:  # noqa: BLE001
-            drow, diag_error = None, True
-        if drow:
-            diag = drow["payload"]
-            if isinstance(diag, str):  # no jsonb codec registered — asyncpg hands back text
-                diag = json.loads(diag)
-            diag_at = drow["computed_at"]
-        now = now_ist()
-        code, headline = entry_verdict(
-            diag, bot_enabled=bot_enabled, today_str=now.date().isoformat(),
-            now_hhmm=now.strftime("%H:%M"), is_weekday=now.weekday() < 5)
-        if diag_error:
-            code, headline = "nodata", "Diagnostics unavailable — is sql/017_entry_diagnostics.sql applied?"
-        why = {
-            "code": code,
-            "headline": headline,
-            "computed_at": diag_at,
-            "d": diag,
-            "requirements": entry_requirements((diag or {}).get("params") or {}),
-        }
+            diag, diag_at = None, None
+            if drows:
+                diag = drows[0]["payload"]
+                if isinstance(diag, str):  # no jsonb codec registered — asyncpg hands back text
+                    diag = json.loads(diag)
+                diag = {**_DIAG_DEFAULTS, **diag}  # raises (→ degraded) if it isn't an object
+                diag_at = drows[0]["computed_at"]
+            now = now_ist()
+            code, headline = entry_verdict(
+                diag, bot_enabled=bot_enabled, today_str=now.date().isoformat(),
+                now_hhmm=now.strftime("%H:%M"), is_weekday=now.weekday() < 5)
+            why = {
+                "code": code,
+                "headline": headline,
+                "computed_at": diag_at,
+                "d": diag,
+                "requirements": entry_requirements((diag or {}).get("params") or {}),
+            }
+        except Exception as exc:  # noqa: BLE001
+            log.exception("/bot why-not-buying panel failed")
+            degraded.append(f"why-not-buying panel: {exc}")
+            why = None
 
     return request.app.state.templates.TemplateResponse(
         request, "bot.html",
@@ -178,6 +209,7 @@ async def bot_page(request: Request) -> HTMLResponse:
             "pending_reconcile": [dict(r) for r in pending_reconcile],
             "shadow_points": shadow_points,
             "why": why,
+            "degraded": degraded,
             "market_open": is_market_open(),
         },
     )

@@ -347,6 +347,21 @@ Friday ≥15:30 → Sunday (a weekend resurrect is fine, send-once dedups; a Mon
 send an empty week). Tests 53/53. Deploy: `pm2 delete paperaglo-daily-digest` if it was started, then
 `pm2 start ecosystem.config.js --only paperaglo-weekly-digest` + `pm2 save`.
 
+## 2026-10-01 — /bot 500: sql/015 was never applied; optional sections now fail soft
+
+`/bot` returned Internal Server Error: `relation "cash_reconcile" does not exist`. `sql/015` (the
+2026-09-08 one-tap reconcile queue) had never been run on the VPS, so the page broke once the web app
+restarted onto code that reads it — and the trader's `emit_cash_reconcile_alerts` had been failing
+(caught + logged) every tick, i.e. the reconcile feature never ran in production. Fix: apply the
+migration (all of `sql/009`–`017` are idempotent, safe to re-run). Hardening, because this page hosts
+the master kill switch: the optional sections (cash reconcile, shadow buy-points, why-not-buying) go
+through `_optional_fetch` — on failure they log, render empty, and a banner names the failing section
+and its `sql/` file; the why-panel payload is normalized to a full key set (`_DIAG_DEFAULTS`) so a
+partial payload can't crash the template (render errors happen outside the route's guards). Verified
+by calling the real `bot_page` against a stubbed DB raising the production error.
+**Deploy lesson:** on the VPS run `source .venv/bin/activate` first (there is no bare `python`), and
+apply every new `sql/` file before restarting.
+
 ## Prior context (before this log's window)
 
 Predating the above, the live real-money bot was built on the paper rig: real order

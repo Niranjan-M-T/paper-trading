@@ -37,6 +37,15 @@
   {% endif %}
 </header>
 
+{% if degraded %}
+<!-- Optional sections that failed to load (usually a sql/ migration not applied on this server) -->
+<div class="card-2 mb-4 px-4 py-3 text-xs" style="border-left:3px solid #f59e0b">
+  <div class="font-semibold mb-1" style="color:#f59e0b">⚠️ Some sections couldn't load — the bot controls still work.</div>
+  {% for msg in degraded %}<div class="text-muted font-mono">{{ msg }}</div>{% endfor %}
+  <div class="text-muted mt-1">Usually a database migration that hasn't been applied on this server — run the named <span class="font-mono">sql/</span> file.</div>
+</div>
+{% endif %}
+
 <!-- 3-column stat bar -->
 <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4" id="stat-bar">
 
